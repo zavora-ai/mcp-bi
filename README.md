@@ -1,11 +1,18 @@
 # Business Intelligence MCP Server
 
+[![Crates.io](https://img.shields.io/crates/v/mcp-bi.svg)](https://crates.io/crates/mcp-bi)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![ADK-Rust Enterprise](https://img.shields.io/badge/ADK--Rust-Enterprise-purple.svg)](https://enterprise.adk-rust.com)
+[![Registry Ready](https://img.shields.io/badge/ADK_Registry-Ready-green.svg)](https://www.zavora.ai)
 
 Read, drill into and draw the dashboards a business already has. Open source first:
 **Apache Superset** is the primary backend, with Metabase alongside it, and the five
 most widely deployed commercial platforms as optional backends behind the same
 interface.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/zavora-ai/mcp-bi/main/docs/architecture.svg" alt="Business Intelligence MCP Architecture" width="780"/>
+</p>
 
 An agent writes one set of calls. Swapping vendor does not change them.
 

@@ -2,14 +2,15 @@
 name = "mcp-bi"
 version = "0.1.0"
 edition = "2024"
-authors = ["James Karanja Maina"]
+authors = ["James Karanja <james.karanja@zavora.ai>"]
+description = "Business Intelligence MCP Server — read, drill into and render the saved dashboards an organisation already has. Apache Superset is the primary open-source backend, with Metabase alongside it and Power BI, Tableau, Looker, Qlik Sense and Amazon QuickSight as optional backends behind one interface. Returns the numbers behind a visual, computes the statistics worth citing, and draws charts server-side with charts-rs"
 license = "Apache-2.0"
-homepage = "https://www.zavora.ai"
 repository = "https://github.com/zavora-ai/mcp-bi"
-rust-version = "1.94.1"
-description = "Business intelligence MCP server — read, drill into and render saved dashboards from Apache Superset, Metabase, Power BI, Tableau, Looker, Qlik and QuickSight"
+homepage = "https://enterprise.adk-rust.com"
 keywords = ["mcp", "bi", "superset", "dashboard", "analytics"]
-categories = ["command-line-utilities"]
+categories = ["development-tools"]
+readme = "README.md"
+rust-version = "1.94.1"
 
 [dependencies]
 adk-mcp-sdk = "0.1"

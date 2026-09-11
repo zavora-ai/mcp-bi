@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 470" font-family="system-ui, -apple-system, sans-serif">
+  <defs>
+    <linearGradient id="hg" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" style="stop-color:#1d4ed8"/><stop offset="100%" style="stop-color:#0891b2"/></linearGradient>
+    <marker id="a" markerWidth="8" markerHeight="8" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#64748b"/></marker>
+  </defs>
+  <rect width="780" height="470" fill="#f8fafc" rx="12"/>
+  <rect x="240" y="10" width="300" height="28" rx="8" fill="url(#hg)"/>
+  <text x="390" y="29" text-anchor="middle" fill="white" font-size="12" font-weight="bold">mcp-bi — Business Intelligence MCP Server</text>
+
+  <!-- agent -->
+  <rect x="300" y="58" width="180" height="34" rx="8" fill="#fff" stroke="#cbd5e1"/>
+  <text x="390" y="80" text-anchor="middle" font-size="12" fill="#0f172a">Agent (MCP client, stdio)</text>
+  <line x1="390" y1="92" x2="390" y2="112" stroke="#64748b" stroke-width="1.5" marker-end="url(#a)"/>
+
+  <!-- tool surface -->
+  <rect x="40" y="112" width="700" height="86" rx="10" fill="#fff" stroke="#cbd5e1"/>
+  <text x="56" y="132" font-size="11" font-weight="bold" fill="#334155">12 read-only tools</text>
+  <text x="56" y="152" font-size="10" fill="#475569">bi_list_dashboards · bi_get_dashboard · bi_list_datasets · bi_describe_dataset</text>
+  <text x="56" y="169" font-size="10" fill="#475569">bi_chart_data · bi_drill_down · bi_query · bi_insights</text>
+  <text x="56" y="186" font-size="10" fill="#475569">bi_render_chart · bi_export_dashboard_image · bi_dashboard_url · bi_backend_info</text>
+  <rect x="596" y="126" width="128" height="30" rx="6" fill="#ecfdf5" stroke="#6ee7b7"/>
+  <text x="660" y="145" text-anchor="middle" font-size="10" fill="#065f46">writes_allowed: none</text>
+
+  <!-- render + insight -->
+  <rect x="40" y="216" width="330" height="60" rx="10" fill="#fff" stroke="#cbd5e1"/>
+  <text x="56" y="236" font-size="11" font-weight="bold" fill="#334155">render.rs — charts-rs + statistics</text>
+  <text x="56" y="254" font-size="10" fill="#475569">PNG server-side, no browser. Every image ships</text>
+  <text x="56" y="269" font-size="10" fill="#475569">the rows and statistics it was drawn from.</text>
+
+  <rect x="410" y="216" width="330" height="60" rx="10" fill="#fff" stroke="#cbd5e1"/>
+  <text x="426" y="236" font-size="11" font-weight="bold" fill="#334155">backend.rs — one BiBackend trait</text>
+  <text x="426" y="254" font-size="10" fill="#475569">A missing capability is an error naming the platform</text>
+  <text x="426" y="269" font-size="10" fill="#475569">and the workaround, never an empty result.</text>
+
+  <line x1="390" y1="198" x2="390" y2="214" stroke="#64748b" stroke-width="1.5" marker-end="url(#a)"/>
+  <line x1="575" y1="276" x2="575" y2="298" stroke="#64748b" stroke-width="1.5" marker-end="url(#a)"/>
+
+  <!-- backends -->
+  <rect x="40" y="300" width="700" height="150" rx="10" fill="#fff" stroke="#cbd5e1"/>
+  <text x="56" y="320" font-size="11" font-weight="bold" fill="#334155">8 backends — selected by BI_BACKEND</text>
+
+  <rect x="56" y="332" width="150" height="46" rx="6" fill="#eff6ff" stroke="#93c5fd"/>
+  <text x="131" y="350" text-anchor="middle" font-size="10" font-weight="bold" fill="#1e3a8a">memory (default)</text>
+  <text x="131" y="366" text-anchor="middle" font-size="9" fill="#1e40af">seeded, no credentials</text>
+
+  <rect x="216" y="332" width="150" height="46" rx="6" fill="#ecfdf5" stroke="#6ee7b7"/>
+  <text x="291" y="350" text-anchor="middle" font-size="10" font-weight="bold" fill="#065f46">superset (primary)</text>
+  <text x="291" y="366" text-anchor="middle" font-size="9" fill="#047857">Apache 2.0 · live-verified</text>
+
+  <rect x="376" y="332" width="150" height="46" rx="6" fill="#ecfdf5" stroke="#6ee7b7"/>
+  <text x="451" y="350" text-anchor="middle" font-size="10" font-weight="bold" fill="#065f46">metabase</text>
+  <text x="451" y="366" text-anchor="middle" font-size="9" fill="#047857">open source</text>
+
+  <rect x="536" y="332" width="188" height="46" rx="6" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="630" y="350" text-anchor="middle" font-size="10" font-weight="bold" fill="#334155">powerbi · tableau · looker</text>
+  <text x="630" y="366" text-anchor="middle" font-size="10" font-weight="bold" fill="#334155">qlik · quicksight</text>
+
+  <text x="56" y="400" font-size="10" fill="#475569">http.rs injects the HTTP client, so every vendor adapter is unit-tested against recorded fixtures with no network.</text>
+  <text x="56" y="417" font-size="10" fill="#475569">Superset reads chart data through POST /api/v1/chart/data, and SQL Lab with a CSRF token plus its session cookie.</text>
+  <text x="56" y="434" font-size="10" fill="#64748b">Power BI's push/streaming datasets retire 2027-10-31, so it is read through Execute Queries (DAX) and Export To File.</text>
+</svg>

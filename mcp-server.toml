@@ -9,3 +9,87 @@ transports = ["stdio"]
 credentials = []
 governance_gates = []
 environments = ["development", "staging", "production"]
+
+[[tools]]
+name = "bi_backend_info"
+description = "Report the connected BI platform and what it can actually do"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "bi_list_dashboards"
+description = "List the saved dashboards on the connected platform"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "bi_get_dashboard"
+description = "Open one dashboard: charts, drillable dimensions and its URL"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "bi_list_datasets"
+description = "List the datasets or semantic models available to query"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "bi_describe_dataset"
+description = "Describe a dataset: columns, types and which are groupable"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "bi_chart_data"
+description = "Read the authoritative numbers behind one chart"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "bi_drill_down"
+description = "Narrow a chart by filters and break it down by a dimension"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "bi_query"
+description = "Run SQL, DAX or an explore query against a dataset"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "bi_insights"
+description = "Compute direction, change, extremes, deviation and outliers for a chart"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "bi_render_chart"
+description = "Draw a chart's numbers to PNG server-side and return it with its statistics"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "bi_export_dashboard_image"
+description = "Ask the platform to render a dashboard to an image"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "bi_dashboard_url"
+description = "Build a deep link that opens a dashboard with filters applied"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
