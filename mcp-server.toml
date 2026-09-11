@@ -1,0 +1,11 @@
+server_id = "mcp_bi"
+display_name = "Business Intelligence"
+version = "0.1.0"
+domain = "analytics"
+sdk_version = "0.1.0"
+risk_level = "low"
+writes_allowed = "none"
+transports = ["stdio"]
+credentials = []
+governance_gates = []
+environments = ["development", "staging", "production"]

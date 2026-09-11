@@ -1,0 +1,37 @@
+[package]
+name = "mcp-bi"
+version = "0.1.0"
+edition = "2024"
+authors = ["James Karanja Maina"]
+license = "Apache-2.0"
+homepage = "https://www.zavora.ai"
+repository = "https://github.com/zavora-ai/mcp-bi"
+rust-version = "1.94.1"
+description = "Business intelligence MCP server — read, drill into and render saved dashboards from Apache Superset, Metabase, Power BI, Tableau, Looker, Qlik and QuickSight"
+keywords = ["mcp", "bi", "superset", "dashboard", "analytics"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+adk-mcp-sdk = "0.1"
+rmcp = { version = "3.1.2", features = ["server", "transport-io", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies"] }
+base64 = "0.22"
+# Server-side chart rendering: no browser, no JavaScript, no headless Chrome.
+charts-rs = { version = "1", features = ["png"] }
+urlencoding = "2"
+
+[features]
+default = []
+# Exposes the fixture-backed HTTP client outside tests, so a host embedding this
+# crate can exercise a vendor adapter without that vendor's account.
+recorded-http = []
+
+[workspace]
