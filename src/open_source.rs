@@ -18,15 +18,42 @@ use crate::http::Http;
 use crate::types::{
     Capabilities, ChartRef, Column, Dashboard, Dataset, DrillResult, Filter, Table,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use chrono::Utc;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Read a bearer token from the environment, or say which variable is missing.
 fn token(variable: &str) -> Result<String> {
     std::env::var(variable)
         .map_err(|_| anyhow!("{variable} is not set. This backend needs it to authenticate."))
+}
+
+/// Refresh this many seconds before the token's stated expiry, so a request that
+/// is issued just under the wire is not rejected on arrival.
+const REFRESH_MARGIN_SECS: i64 = 60;
+
+/// Read the `exp` claim from a JWT without verifying it.
+///
+/// The signature is Superset's business, not ours — all this needs is to know when
+/// the token stops being useful so it can be replaced before a call fails. A token
+/// that is not a JWT, or carries no `exp`, returns `None` and is treated as good
+/// until the server says otherwise.
+fn expiry_of(token: &str) -> Option<i64> {
+    use base64::Engine as _;
+    let claims = token.split('.').nth(1)?;
+    let padded = match claims.len() % 4 {
+        0 => claims.to_string(),
+        remainder => format!("{claims}{}", "=".repeat(4 - remainder)),
+    };
+    let decoded = base64::engine::general_purpose::URL_SAFE
+        .decode(padded)
+        .ok()?;
+    serde_json::from_slice::<Value>(&decoded)
+        .ok()?
+        .get("exp")?
+        .as_i64()
 }
 
 fn base(variable: &str, fallback: &str) -> String {
@@ -69,15 +96,54 @@ fn table_from_records(records: &[Value], preferred: Option<Vec<String>>) -> Tabl
 pub struct Superset {
     http: Arc<dyn Http>,
     base: String,
-    token: String,
+    /// The bearer token in use. Behind a lock because a refresh replaces it while
+    /// the backend is shared immutably across concurrent tool calls.
+    token: RwLock<String>,
+    /// When the current token stops being accepted, read from its own `exp` claim.
+    expires_at: RwLock<Option<i64>>,
+    /// Set when the server may mint its own tokens, which is what lets a session
+    /// outlive the 15 minutes one token is good for.
+    login: Option<Login>,
+}
+
+/// What the server needs to obtain a token itself, rather than being handed one.
+struct Login {
+    username: String,
+    password: String,
+    provider: String,
 }
 
 impl Superset {
     pub fn from_env(http: Arc<dyn Http>) -> Result<Self> {
+        let login = match (
+            std::env::var("SUPERSET_USERNAME"),
+            std::env::var("SUPERSET_PASSWORD"),
+        ) {
+            (Ok(username), Ok(password)) => Some(Login {
+                username,
+                password,
+                provider: std::env::var("SUPERSET_AUTH_PROVIDER")
+                    .unwrap_or_else(|_| "db".to_string()),
+            }),
+            _ => None,
+        };
+        // Either is enough on its own: a token to start with, or credentials to mint
+        // one. Neither is a configuration error worth naming both remedies for.
+        let token = std::env::var("SUPERSET_TOKEN").unwrap_or_default();
+        if token.is_empty() && login.is_none() {
+            bail!(
+                "Superset needs credentials. Set SUPERSET_USERNAME and SUPERSET_PASSWORD so the \
+                 server can obtain and refresh tokens itself, or SUPERSET_TOKEN to supply one \
+                 directly — though a Superset access token is only valid for 15 minutes, so a \
+                 session longer than that will fail partway through."
+            )
+        }
         Ok(Self {
             http,
             base: base("SUPERSET_URL", "http://localhost:8088"),
-            token: token("SUPERSET_TOKEN")?,
+            expires_at: RwLock::new(expiry_of(&token)),
+            token: RwLock::new(token),
+            login,
         })
     }
 
@@ -86,13 +152,106 @@ impl Superset {
         Self {
             http,
             base: base_url.trim_end_matches('/').to_string(),
-            token: token.to_string(),
+            expires_at: RwLock::new(expiry_of(token)),
+            token: RwLock::new(token.to_string()),
+            login: None,
         }
+    }
+
+    /// A token to start with *and* the credentials to replace it when it expires.
+    ///
+    /// This is the durable configuration: no login on startup if a token is already
+    /// in hand, and no failure partway through once that token runs out. Pass an
+    /// empty token to log in on the first request.
+    pub fn with_login(
+        http: Arc<dyn Http>,
+        base_url: &str,
+        token: &str,
+        username: &str,
+        password: &str,
+    ) -> Self {
+        Self {
+            http,
+            base: base_url.trim_end_matches('/').to_string(),
+            expires_at: RwLock::new(expiry_of(token)),
+            token: RwLock::new(token.to_string()),
+            login: Some(Login {
+                username: username.to_string(),
+                password: password.to_string(),
+                provider: "db".to_string(),
+            }),
+        }
+    }
+
+    /// True when the current token is missing, or close enough to expiry that a
+    /// request started now could be rejected by the time it arrives.
+    fn stale(&self) -> bool {
+        if self.token.read().expect("token lock").is_empty() {
+            return true;
+        }
+        match *self.expires_at.read().expect("expiry lock") {
+            // A token whose expiry we could not read is assumed good; the caller
+            // supplied it deliberately and only the server can judge it.
+            None => false,
+            Some(exp) => Utc::now().timestamp() + REFRESH_MARGIN_SECS >= exp,
+        }
+    }
+
+    /// Exchange the configured credentials for a fresh access token.
+    async fn refresh(&self, login: &Login) -> Result<()> {
+        let body = self
+            .http
+            .post_json(
+                &format!("{}/api/v1/security/login", self.base),
+                &[("Content-Type".into(), "application/json".into())],
+                json!({
+                    "username": login.username,
+                    "password": login.password,
+                    "provider": login.provider,
+                    "refresh": true,
+                }),
+            )
+            .await
+            .context("Superset login failed")?;
+        let fresh = body
+            .get("access_token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                anyhow!("Superset login returned no access_token. Check the username and password.")
+            })?;
+        *self.expires_at.write().expect("expiry lock") = expiry_of(fresh);
+        *self.token.write().expect("token lock") = fresh.to_string();
+        tracing::info!("refreshed the Superset access token");
+        Ok(())
+    }
+
+    /// Headers for a request, refreshing the token first when it is about to expire.
+    ///
+    /// Every request goes through here, so a long analysis session survives a token
+    /// lifetime instead of failing partway through with an opaque 401.
+    async fn auth(&self) -> Result<Vec<(String, String)>> {
+        if self.stale() {
+            match &self.login {
+                Some(login) => self.refresh(login).await?,
+                // Nothing can be done about it here, so say what would fix it rather
+                // than letting Superset answer with `{"msg":"Token has expired"}`.
+                None => bail!(
+                    "The Superset token has expired. A Superset access token is valid for 15 \
+                     minutes, which is shorter than a typical analysis session. Set \
+                     SUPERSET_USERNAME and SUPERSET_PASSWORD so this server can refresh it \
+                     itself, or supply a newer SUPERSET_TOKEN."
+                ),
+            }
+        }
+        Ok(self.headers())
     }
 
     fn headers(&self) -> Vec<(String, String)> {
         vec![
-            ("Authorization".into(), format!("Bearer {}", self.token)),
+            (
+                "Authorization".into(),
+                format!("Bearer {}", self.token.read().expect("token lock")),
+            ),
             ("Accept".into(), "application/json".into()),
         ]
     }
@@ -125,7 +284,7 @@ impl Superset {
             .http
             .get_json(
                 &format!("{}/api/v1/chart/{chart_id}", self.base),
-                &self.headers(),
+                &self.auth().await?,
             )
             .await?;
         let result = chart
@@ -185,7 +344,7 @@ impl Superset {
             .http
             .post_json(
                 &format!("{}/api/v1/chart/data", self.base),
-                &self.headers(),
+                &self.auth().await?,
                 body,
             )
             .await?;
@@ -257,7 +416,7 @@ impl BiBackend for Superset {
 
     async fn list_dashboards(&self) -> Result<Vec<Dashboard>> {
         let url = format!("{}/api/v1/dashboard/?q=(page_size:100)", self.base);
-        let body = self.http.get_json(&url, &self.headers()).await?;
+        let body = self.http.get_json(&url, &self.auth().await?).await?;
         let result = body
             .get("result")
             .and_then(Value::as_array)
@@ -292,7 +451,7 @@ impl BiBackend for Superset {
             .http
             .get_json(
                 &format!("{}/api/v1/dashboard/{id}", self.base),
-                &self.headers(),
+                &self.auth().await?,
             )
             .await?;
         let result = detail.get("result").unwrap_or(&detail);
@@ -302,7 +461,7 @@ impl BiBackend for Superset {
             .http
             .get_json(
                 &format!("{}/api/v1/dashboard/{id}/charts", self.base),
-                &self.headers(),
+                &self.auth().await?,
             )
             .await
             .unwrap_or(Value::Null);
@@ -395,7 +554,7 @@ impl BiBackend for Superset {
             .http
             .get_json(
                 &format!("{}/api/v1/dataset/?q=(page_size:100)", self.base),
-                &self.headers(),
+                &self.auth().await?,
             )
             .await?;
         Ok(body
@@ -426,7 +585,7 @@ impl BiBackend for Superset {
             .http
             .get_json(
                 &format!("{}/api/v1/dataset/{id}", self.base),
-                &self.headers(),
+                &self.auth().await?,
             )
             .await?;
         let result = body.get("result").unwrap_or(&body);
@@ -519,7 +678,7 @@ impl BiBackend for Superset {
             .http
             .get_json(
                 &format!("{}/api/v1/dataset/{dataset_id}", self.base),
-                &self.headers(),
+                &self.auth().await?,
             )
             .await?;
         let database_id = dataset
@@ -536,7 +695,7 @@ impl BiBackend for Superset {
             .http
             .get_json(
                 &format!("{}/api/v1/security/csrf_token/", self.base),
-                &self.headers(),
+                &self.auth().await?,
             )
             .await
             .ok();
@@ -584,7 +743,7 @@ impl BiBackend for Superset {
             "{}/api/v1/dashboard/{dashboard_id}/thumbnail/current/",
             self.base
         );
-        self.http.get_bytes(&url, &self.headers()).await
+        self.http.get_bytes(&url, &self.auth().await?).await
     }
 
     async fn deep_link(&self, dashboard_id: &str, filters: &[Filter]) -> Result<String> {

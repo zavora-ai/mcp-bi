@@ -2,7 +2,8 @@
 """Exercise mcp-bi against a live Apache Superset, over real MCP stdio.
 
 Proves the primary backend against the platform itself rather than against
-recorded fixtures. Reads SUPERSET_URL and SUPERSET_TOKEN from the environment.
+recorded fixtures. Reads SUPERSET_URL and either SUPERSET_USERNAME/SUPERSET_PASSWORD
+or SUPERSET_TOKEN from the environment.
 """
 import json
 import os

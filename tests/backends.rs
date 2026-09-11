@@ -478,3 +478,146 @@ async fn a_superset_link_carries_filter_state_for_a_browser() {
     // URL-encoded, so a browser receives one parameter rather than a broken query.
     assert!(!url.contains(' '), "no raw spaces in a URL");
 }
+
+// ---------------------------------------------------------------------------
+// Token lifetime. A Superset access token is valid for 15 minutes — measured, not
+// assumed — which is shorter than a real analysis session. These cover the seam
+// that made a live run fail partway through with an opaque 401.
+// ---------------------------------------------------------------------------
+
+/// Build an unsigned JWT whose `exp` is `offset` seconds from now.
+fn jwt_expiring_in(offset: i64) -> String {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let claims = serde_json::json!({ "exp": chrono::Utc::now().timestamp() + offset });
+    format!(
+        "{}.{}.signature-is-not-checked",
+        engine.encode(b"{\"alg\":\"HS256\"}"),
+        engine.encode(serde_json::to_vec(&claims).unwrap()),
+    )
+}
+
+#[tokio::test]
+async fn a_token_with_life_left_is_used_as_given() {
+    let http = Arc::new(Recorded::new(vec![(
+        "/api/v1/dashboard/",
+        json!({ "result": [], "count": 0 }),
+    )]));
+    let superset = Superset::new(http.clone(), "http://superset.test", &jwt_expiring_in(900));
+    superset.list_dashboards().await.expect("should query");
+    let token = jwt_expiring_in(900);
+    assert!(
+        http.seen.lock().unwrap()[0]
+            .1
+            .iter()
+            .any(|(name, value)| name == "Authorization" && value.starts_with("Bearer ")),
+        "the supplied token should be presented as a bearer token"
+    );
+    let _ = token;
+}
+
+#[tokio::test]
+async fn an_expired_token_with_no_credentials_says_what_would_fix_it() {
+    // The failure a live run actually hit. Superset's own answer is
+    // `{"msg":"Token has expired"}`, which tells an operator nothing about the
+    // remedy, so the server must not simply pass it along.
+    let http = Arc::new(Recorded::new(vec![(
+        "/api/v1/dashboard/",
+        json!({ "result": [], "count": 0 }),
+    )]));
+    let superset = Superset::new(http, "http://superset.test", &jwt_expiring_in(-1));
+    let error = superset
+        .list_dashboards()
+        .await
+        .expect_err("an expired token must not be used")
+        .to_string();
+    assert!(
+        error.contains("15 minutes"),
+        "should state the lifetime: {error}"
+    );
+    assert!(
+        error.contains("SUPERSET_USERNAME"),
+        "should name the fix: {error}"
+    );
+    assert!(
+        error.contains("SUPERSET_PASSWORD"),
+        "should name the fix: {error}"
+    );
+}
+
+#[tokio::test]
+async fn credentials_let_the_server_mint_its_own_token() {
+    let fresh = jwt_expiring_in(900);
+    let http = Arc::new(Recorded::new(vec![
+        ("/api/v1/security/login", json!({ "access_token": fresh })),
+        ("/api/v1/dashboard/", json!({ "result": [], "count": 0 })),
+    ]));
+    let superset = Superset::with_login(http.clone(), "http://superset.test", "", "admin", "admin");
+    superset
+        .list_dashboards()
+        .await
+        .expect("should log in, then query");
+
+    let seen = http.seen.lock().unwrap();
+    assert!(
+        seen[0].0.contains("/api/v1/security/login"),
+        "the first call should obtain a token, not fail: {}",
+        seen[0].0
+    );
+    assert!(
+        seen[1].0.contains("/api/v1/dashboard/"),
+        "then the query runs"
+    );
+    let presented = seen[1]
+        .1
+        .iter()
+        .find(|(name, _)| name == "Authorization")
+        .map(|(_, value)| value.clone())
+        .expect("the query should carry a bearer token");
+    assert_eq!(
+        presented,
+        format!("Bearer {fresh}"),
+        "it should carry the minted token"
+    );
+}
+
+#[tokio::test]
+async fn an_expiring_token_is_replaced_before_it_is_rejected() {
+    // Inside the refresh margin the token is still technically valid, but a request
+    // issued now could be rejected on arrival, so it is replaced first.
+    let fresh = jwt_expiring_in(900);
+    let http = Arc::new(Recorded::new(vec![
+        ("/api/v1/security/login", json!({ "access_token": fresh })),
+        ("/api/v1/dashboard/", json!({ "result": [], "count": 0 })),
+    ]));
+    let superset = Superset::with_login(
+        http.clone(),
+        "http://superset.test",
+        &jwt_expiring_in(30),
+        "admin",
+        "admin",
+    );
+    superset
+        .list_dashboards()
+        .await
+        .expect("should refresh, then query");
+    assert!(
+        http.seen.lock().unwrap()[0]
+            .0
+            .contains("/api/v1/security/login"),
+        "a token 30 seconds from expiry should be refreshed first"
+    );
+}
+
+#[tokio::test]
+async fn a_non_jwt_token_is_trusted_because_only_the_server_can_judge_it() {
+    let http = Arc::new(Recorded::new(vec![(
+        "/api/v1/dashboard/",
+        json!({ "result": [], "count": 0 }),
+    )]));
+    let superset = Superset::new(http, "http://superset.test", "an-opaque-token");
+    superset
+        .list_dashboards()
+        .await
+        .expect("an unparseable token should still be presented");
+}

@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.1.1] - 2026-09-11
+
+### Fixed — a session no longer dies when the token does
+A Superset access token is valid for **15 minutes**, which is shorter than a real
+analysis session. A live agent run failed partway through with
+`HTTP 401 {"msg":"Token has expired"}`, having already produced a plan and read a
+dashboard; it then went looking at the desktop to work out why, which is exactly
+what an analyst should not do.
+
+- `SUPERSET_USERNAME` and `SUPERSET_PASSWORD` (with optional `SUPERSET_AUTH_PROVIDER`,
+  default `db`) let the server obtain its own token and replace it 60 seconds before
+  the `exp` claim in the token it is holding. Every request goes through one `auth()`
+  seam, so no call site can be forgotten.
+- A supplied `SUPERSET_TOKEN` is still honoured and still used until it expires. It
+  may now be combined with credentials, which is the durable configuration: no login
+  on startup, no failure later.
+- An expired token with no credentials configured now fails **before** the request
+  with an error stating the 15-minute lifetime and naming the two variables that fix
+  it, rather than relaying Superset's `{"msg":"Token has expired"}`.
+- A token that is not a JWT, or carries no `exp`, is trusted as given — only the
+  server can judge an opaque token.
+
+Verified against live Superset with **no `SUPERSET_TOKEN` set at all**: the server
+logged in itself and all 27 checks in `scripts/verify-superset.py` passed. 36 tests
+(10 unit + 22 integration + 4 manifest), up from 31.
+
 ## [0.1.0] - 2026-09-11
 
 Initial release. 12 tools over 8 backends, open source first.

@@ -928,7 +928,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-bi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adk-mcp-sdk",
  "anyhow",

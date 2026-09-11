@@ -72,12 +72,20 @@ agent, so `writes_allowed = "none"` and there is no approval surface.
 cargo run                       # seeded fixture: three dashboards, no setup
 BI_BACKEND=superset \
   SUPERSET_URL=http://localhost:8088 \
-  SUPERSET_TOKEN=... cargo run
+  SUPERSET_USERNAME=admin SUPERSET_PASSWORD=... cargo run
 ```
+
+**Give Superset a username and password, not a token.** A Superset access token is
+valid for **15 minutes** — measured, not assumed — which is shorter than a real
+analysis session. With credentials the server mints its own token and replaces it a
+minute before it expires, so a long session cannot die partway through. A supplied
+`SUPERSET_TOKEN` still works and is used until it expires; after that, a request
+fails with an error naming this remedy rather than passing along Superset's
+`{"msg":"Token has expired"}`.
 
 | Backend | Variables |
 |---|---|
-| `superset` | `SUPERSET_URL`, `SUPERSET_TOKEN` |
+| `superset` | `SUPERSET_URL`, and either `SUPERSET_USERNAME` + `SUPERSET_PASSWORD` (preferred, self-refreshing) or `SUPERSET_TOKEN`. Optional `SUPERSET_AUTH_PROVIDER` (default `db`) |
 | `metabase` | `METABASE_URL`, `METABASE_TOKEN` |
 | `powerbi` | `POWERBI_TOKEN`, optional `POWERBI_GROUP_ID`, `POWERBI_API` |
 | `tableau` | `TABLEAU_URL`, `TABLEAU_TOKEN`, `TABLEAU_SITE_ID` |
@@ -126,10 +134,7 @@ docker exec superset-bi superset init
 docker exec superset-bi superset load_examples          # 9 real dashboards
 
 export SUPERSET_URL=http://localhost:8088
-export SUPERSET_TOKEN=$(curl -s -X POST $SUPERSET_URL/api/v1/security/login \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"admin","provider":"db","refresh":true}' \
-  | python3 -c 'import json,sys;print(json.load(sys.stdin)["access_token"])')
+export SUPERSET_USERNAME=admin SUPERSET_PASSWORD=admin
 
 python3 scripts/verify-superset.py ./target/release/mcp-bi
 ```
