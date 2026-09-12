@@ -1,6 +1,6 @@
 server_id = "mcp_bi"
 display_name = "Business Intelligence"
-version = "0.1.2"
+version = "0.2.0"
 domain = "analytics"
 sdk_version = "0.1.0"
 risk_level = "low"
@@ -83,6 +83,27 @@ credential_bindings = []
 [[tools]]
 name = "bi_export_dashboard_image"
 description = "Ask the platform to render a dashboard to an image"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "bi_remember"
+description = "Record a correction so it is not rediscovered next time"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "bi_recall"
+description = "Recall corrections recorded earlier that bear on this question"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "bi_forget"
+description = "Remove a note whose correction turned out to be wrong"
 risk_class = "read_only"
 requires_approval = false
 credential_bindings = []

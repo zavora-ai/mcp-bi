@@ -7,6 +7,7 @@ pub mod backend;
 pub mod http;
 pub mod memory;
 pub mod open_source;
+pub mod recall;
 pub mod render;
 pub mod server;
 pub mod types;

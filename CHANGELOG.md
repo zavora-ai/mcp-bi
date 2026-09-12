@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.2.0] - 2026-09-12
+
+### Added — memory, so a correction is learned once
+A data platform is full of facts its schema does not contain: which of four
+similarly-named charts people mean by "revenue", that a filter wants an exact
+value rather than a fuzzy match, that a dataset id is a table id and not a
+database id. An agent rediscovers each of those the expensive way every session
+unless something writes them down. OpenAI published the measurement that makes
+the case — the same question against their internal data agent took **22m 41s
+without memory and 1m 22s with it**.
+
+- **`bi_remember`** records a correction, replacing any earlier note on the same
+  subject so a corrected correction does not sit beside its replacement.
+- **`bi_recall`** offers back the notes bearing on a question, ranked by word
+  overlap and by how often each has proved useful before.
+- **`bi_forget`** removes one, because a wrong correction is worse than none.
+
+Notes are **corrections, not knowledge**. A figure would be wrong next month, and
+every number should come from a fresh query.
+
+Scoped per backend: a Superset chart id means nothing to Metabase, so it is never
+offered there. Persisted through a temp-file rename, so an interrupted write
+cannot destroy a readable file. Bounded at 500 notes and 600 characters each.
+Retrieval is keyword overlap rather than embeddings, which keeps it deterministic,
+testable offline and free of an API key. An unwritable location degrades to
+session-only with a warning rather than failing a read-only server.
+
+Notes are written by a model and later read by one, so they are returned labelled
+as recorded observations to verify, never as instructions.
+
+15 tools. 46 tests (12 unit + 32 integration + 4 manifest), including one that
+proves a note survives a process restart.
+
 ## [0.1.2] - 2026-09-12
 
 ### Fixed — Metabase queries ran against the wrong id space

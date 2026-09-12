@@ -692,3 +692,187 @@ async fn an_id_that_is_not_a_table_says_so_rather_than_guessing_a_database() {
         "should name what is missing: {error}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Memory. OpenAI measured the same question taking 22m41s without it and 1m22s
+// with it; the reason is that a data platform is full of facts its schema does
+// not contain. These cover what must be true for that to work: a correction
+// survives, it is scoped to the platform it was learned on, and a wrong one can
+// be removed.
+// ---------------------------------------------------------------------------
+
+use mcp_bi::recall::Recall;
+
+fn at(when: &str) -> String {
+    format!("2026-09-12T{when}:00Z")
+}
+
+#[test]
+fn a_correction_is_recalled_by_a_differently_worded_question() {
+    // The point is not exact matching. A note recorded as "product-line volume
+    // chart" has to come back for "which chart shows volume by product line".
+    let store = Recall::ephemeral();
+    store
+        .remember(
+            "product-line volume chart",
+            "Chart 37 is the one people mean. Chart 12 looks similar but excludes returns.",
+            "superset",
+            Some("3"),
+            &at("10:00"),
+        )
+        .expect("should save");
+    let hits = store.recall(
+        "which chart shows volume by product line?",
+        "superset",
+        None,
+        None,
+    );
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].note.contains("Chart 37"));
+}
+
+#[test]
+fn a_note_is_never_offered_for_a_different_platform() {
+    // A Superset chart id means nothing to Metabase, and offering it would invite
+    // a confident wrong answer.
+    let store = Recall::ephemeral();
+    store
+        .remember(
+            "chart ids",
+            "Chart 37 is product-line volume",
+            "superset",
+            None,
+            &at("10:00"),
+        )
+        .unwrap();
+    assert_eq!(store.recall("chart ids", "superset", None, None).len(), 1);
+    assert!(store.recall("chart ids", "metabase", None, None).is_empty());
+}
+
+#[test]
+fn a_scoped_note_is_relevant_even_when_no_words_match() {
+    let store = Recall::ephemeral();
+    store
+        .remember(
+            "filter values",
+            "The region filter wants ISO codes, not names",
+            "superset",
+            Some("dash-9"),
+            &at("10:00"),
+        )
+        .unwrap();
+    let hits = store.recall("anything at all", "superset", Some("dash-9"), None);
+    assert_eq!(
+        hits.len(),
+        1,
+        "a note scoped to what is being asked about is relevant"
+    );
+}
+
+#[test]
+fn correcting_a_correction_replaces_it_rather_than_stacking() {
+    // Two contradictory notes on the same subject, both looking equally true, is
+    // worse than either alone.
+    let store = Recall::ephemeral();
+    store
+        .remember("chart", "use chart 12", "superset", None, &at("10:00"))
+        .unwrap();
+    store
+        .remember(
+            "chart",
+            "use chart 37, 12 excludes returns",
+            "superset",
+            None,
+            &at("11:00"),
+        )
+        .unwrap();
+    let hits = store.recall("chart", "superset", None, None);
+    assert_eq!(
+        hits.len(),
+        1,
+        "the earlier note should be gone, not ranked below"
+    );
+    assert!(hits[0].note.contains("37"));
+}
+
+#[test]
+fn a_wrong_correction_can_be_forgotten() {
+    let store = Recall::ephemeral();
+    store
+        .remember("chart", "use chart 12", "superset", None, &at("10:00"))
+        .unwrap();
+    assert_eq!(store.forget("chart", "superset").unwrap(), 1);
+    assert!(store.recall("chart", "superset", None, None).is_empty());
+    assert_eq!(
+        store.forget("chart", "superset").unwrap(),
+        0,
+        "forgetting twice is not an error"
+    );
+}
+
+#[test]
+fn a_note_records_how_often_it_earned_its_place() {
+    // A note recalled constantly is load-bearing; one never recalled is a
+    // candidate for removal. Without the count, neither is distinguishable.
+    let store = Recall::ephemeral();
+    store
+        .remember("volume chart", "chart 37", "superset", None, &at("10:00"))
+        .unwrap();
+    store.recall("volume chart", "superset", None, None);
+    store.recall("volume chart", "superset", None, None);
+    assert_eq!(store.all(Some("superset"))[0].recalled, 2);
+}
+
+#[test]
+fn an_empty_or_oversized_note_is_refused_with_the_reason() {
+    let store = Recall::ephemeral();
+    let empty = store.remember("subject", "   ", "superset", None, &at("10:00"));
+    assert!(
+        empty
+            .unwrap_err()
+            .to_string()
+            .contains("subject and a note")
+    );
+
+    let long = "x".repeat(5_000);
+    let error = store
+        .remember("subject", &long, "superset", None, &at("10:00"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("at most"), "should state the limit: {error}");
+    assert!(
+        error.contains("finding"),
+        "should say why: a long note is a finding, not a correction"
+    );
+}
+
+#[tokio::test]
+async fn memory_survives_a_restart() {
+    // The whole value proposition. If it does not outlive the process it saves
+    // nothing, because a session already has its own context.
+    let dir = std::env::temp_dir().join(format!("mcp-bi-recall-{}", std::process::id()));
+    let path = dir.join("memory.json");
+    let _ = std::fs::remove_dir_all(&dir);
+    unsafe { std::env::set_var("BI_MEMORY_PATH", &path) };
+
+    let first = Recall::open_from_env();
+    first
+        .remember(
+            "dataset ids",
+            "A Metabase dataset id is a table id, not a database id",
+            "metabase",
+            None,
+            &at("10:00"),
+        )
+        .expect("should save");
+    assert!(path.exists(), "a note must reach disk");
+    drop(first);
+
+    let second = Recall::open_from_env();
+    let hits = second.recall("what is a dataset id here?", "metabase", None, None);
+    assert_eq!(hits.len(), 1, "a fresh store must find the earlier note");
+    assert!(hits[0].note.contains("table id"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+    unsafe { std::env::remove_var("BI_MEMORY_PATH") };
+}

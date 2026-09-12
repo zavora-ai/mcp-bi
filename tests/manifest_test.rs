@@ -20,7 +20,7 @@ fn manifest_parses_and_validates() {
     );
     assert_eq!(m.server_id, "mcp_bi");
     assert_eq!(m.domain, "analytics");
-    assert_eq!(m.tools.len(), 12, "expected 12 declared tools");
+    assert_eq!(m.tools.len(), 15, "expected 15 declared tools");
 }
 
 #[test]
@@ -64,11 +64,14 @@ fn the_declared_tools_match_the_ones_the_server_exposes() {
         "bi_describe_dataset",
         "bi_drill_down",
         "bi_export_dashboard_image",
+        "bi_forget",
         "bi_get_dashboard",
         "bi_insights",
         "bi_list_dashboards",
         "bi_list_datasets",
         "bi_query",
+        "bi_recall",
+        "bi_remember",
         "bi_render_chart",
     ]
     .into_iter()
