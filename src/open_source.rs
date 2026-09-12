@@ -24,12 +24,6 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use std::sync::{Arc, RwLock};
 
-/// Read a bearer token from the environment, or say which variable is missing.
-fn token(variable: &str) -> Result<String> {
-    std::env::var(variable)
-        .map_err(|_| anyhow!("{variable} is not set. This backend needs it to authenticate."))
-}
-
 /// Refresh this many seconds before the token's stated expiry, so a request that
 /// is issued just under the wire is not rejected on arrival.
 const REFRESH_MARGIN_SECS: i64 = 60;
@@ -760,15 +754,46 @@ impl BiBackend for Superset {
 pub struct Metabase {
     http: Arc<dyn Http>,
     base: String,
-    token: String,
+    /// The session token in use. Behind a lock because re-authenticating replaces it
+    /// while the backend is shared immutably across concurrent tool calls.
+    token: RwLock<String>,
+    /// Set when the server may obtain its own sessions, which is what lets a run
+    /// outlive one session rather than failing partway through.
+    login: Option<MetabaseLogin>,
+}
+
+/// What the server needs to obtain a Metabase session itself.
+struct MetabaseLogin {
+    username: String,
+    password: String,
 }
 
 impl Metabase {
     pub fn from_env(http: Arc<dyn Http>) -> Result<Self> {
+        let login = match (
+            std::env::var("METABASE_USERNAME"),
+            std::env::var("METABASE_PASSWORD"),
+        ) {
+            (Ok(username), Ok(password)) => Some(MetabaseLogin { username, password }),
+            _ => None,
+        };
+        // Either is enough on its own: a session token to start with, or credentials to
+        // obtain one.
+        let token = std::env::var("METABASE_TOKEN").unwrap_or_default();
+        if token.is_empty() && login.is_none() {
+            bail!(
+                "Metabase needs credentials. Set METABASE_USERNAME and METABASE_PASSWORD so the \
+                 server can obtain and renew sessions itself, or METABASE_TOKEN to supply a \
+                 session id directly — though a Metabase session expires (14 days by default, \
+                 and less where an administrator has shortened it), and a supplied one cannot \
+                 be renewed."
+            )
+        }
         Ok(Self {
             http,
             base: base("METABASE_URL", "http://localhost:3000"),
-            token: token("METABASE_TOKEN")?,
+            token: RwLock::new(token),
+            login,
         })
     }
 
@@ -776,8 +801,105 @@ impl Metabase {
         Self {
             http,
             base: base_url.trim_end_matches('/').to_string(),
-            token: token.to_string(),
+            token: RwLock::new(token.to_string()),
+            login: None,
         }
+    }
+
+    /// For a host that holds credentials rather than a session id.
+    pub fn with_login(http: Arc<dyn Http>, base_url: &str, username: &str, password: &str) -> Self {
+        Self {
+            http,
+            base: base_url.trim_end_matches('/').to_string(),
+            token: RwLock::new(String::new()),
+            login: Some(MetabaseLogin {
+                username: username.to_string(),
+                password: password.to_string(),
+            }),
+        }
+    }
+
+    /// Exchange the configured credentials for a fresh session id.
+    async fn authenticate(&self, login: &MetabaseLogin) -> Result<()> {
+        let body = self
+            .http
+            .post_json(
+                &format!("{}/api/session", self.base),
+                &[("Content-Type".into(), "application/json".into())],
+                json!({ "username": login.username, "password": login.password }),
+            )
+            .await
+            .context("Metabase login failed")?;
+        // Measured against Metabase 0.5x: the response is exactly `{"id": "<uuid>"}`.
+        let fresh = body.get("id").and_then(Value::as_str).ok_or_else(|| {
+            anyhow!("Metabase login returned no session id. Check the username and password.")
+        })?;
+        *self.token.write().expect("token lock") = fresh.to_string();
+        tracing::info!("obtained a fresh Metabase session");
+        Ok(())
+    }
+
+    /// Run a request, and if the session is not accepted, obtain a new one and retry once.
+    ///
+    /// Reactive rather than scheduled, unlike Superset. A Superset access token is a JWT,
+    /// so its expiry can be read from the token itself and a refresh timed to beat it. A
+    /// Metabase session id is an opaque UUID that carries no expiry, so the only reliable
+    /// signal that it has lapsed is the platform rejecting it. Measured: an expired session
+    /// answers `401` with the bare body `Unauthenticated` — not JSON, and nothing a parser
+    /// can use, which is why the status is carried as typed context.
+    ///
+    /// Retried exactly once. A second failure means the credentials themselves are wrong,
+    /// and retrying then would turn one clear rejection into a loop.
+    async fn with_session<T, F, Fut>(&self, call: F) -> Result<T>
+    where
+        F: Fn(Vec<(String, String)>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        if self.token.read().expect("token lock").is_empty() {
+            match &self.login {
+                Some(login) => self.authenticate(login).await?,
+                None => bail!("No Metabase session and no credentials to obtain one."),
+            }
+        }
+        match call(self.headers()).await {
+            Err(error) if crate::http::is_unauthorized(&error) => {
+                let Some(login) = &self.login else {
+                    return Err(error).context(
+                        "The Metabase session was rejected. Set METABASE_USERNAME and \
+                         METABASE_PASSWORD so this server can obtain a new one itself, or \
+                         supply a current METABASE_TOKEN.",
+                    );
+                };
+                self.authenticate(login).await?;
+                call(self.headers()).await
+            }
+            other => other,
+        }
+    }
+
+    /// A GET that survives a lapsed session.
+    async fn get(&self, url: &str) -> Result<Value> {
+        let http = Arc::clone(&self.http);
+        let url = url.to_string();
+        self.with_session(move |headers| {
+            let http = Arc::clone(&http);
+            let url = url.clone();
+            async move { http.get_json(&url, &headers).await }
+        })
+        .await
+    }
+
+    /// A POST that survives a lapsed session.
+    async fn post(&self, url: &str, body: Value) -> Result<Value> {
+        let http = Arc::clone(&self.http);
+        let url = url.to_string();
+        self.with_session(move |headers| {
+            let http = Arc::clone(&http);
+            let url = url.clone();
+            let body = body.clone();
+            async move { http.post_json(&url, &headers, body).await }
+        })
+        .await
     }
 
     /// Resolve which database a table belongs to.
@@ -787,12 +909,7 @@ impl Metabase {
     /// the previous code passed the table id straight through as the database, which
     /// worked only when the two happened to coincide.
     async fn database_for_table(&self, table_id: &str) -> Result<i64> {
-        let table = self
-            .http
-            .get_json(
-                &format!("{}/api/table/{table_id}", self.base),
-                &self.headers(),
-            )
+        let table = self.get(&format!("{}/api/table/{table_id}", self.base))
             .await
             .with_context(|| {
                 format!(
@@ -812,7 +929,10 @@ impl Metabase {
     /// Metabase uses its own header rather than `Authorization`.
     fn headers(&self) -> Vec<(String, String)> {
         vec![
-            ("X-Metabase-Session".into(), self.token.clone()),
+            (
+                "X-Metabase-Session".into(),
+                self.token.read().expect("token lock").clone(),
+            ),
             ("Accept".into(), "application/json".into()),
         ]
     }
@@ -839,10 +959,7 @@ impl BiBackend for Metabase {
     }
 
     async fn list_dashboards(&self) -> Result<Vec<Dashboard>> {
-        let body = self
-            .http
-            .get_json(&format!("{}/api/dashboard", self.base), &self.headers())
-            .await?;
+        let body = self.get(&format!("{}/api/dashboard", self.base)).await?;
         let items = body.as_array().cloned().unwrap_or_default();
         Ok(items
             .iter()
@@ -872,11 +989,7 @@ impl BiBackend for Metabase {
 
     async fn get_dashboard(&self, id: &str) -> Result<Dashboard> {
         let body = self
-            .http
-            .get_json(
-                &format!("{}/api/dashboard/{id}", self.base),
-                &self.headers(),
-            )
+            .get(&format!("{}/api/dashboard/{id}", self.base))
             .await?;
         let charts = body
             .get("dashcards")
@@ -927,10 +1040,7 @@ impl BiBackend for Metabase {
     }
 
     async fn list_datasets(&self) -> Result<Vec<Dataset>> {
-        let body = self
-            .http
-            .get_json(&format!("{}/api/table", self.base), &self.headers())
-            .await?;
+        let body = self.get(&format!("{}/api/table", self.base)).await?;
         Ok(body
             .as_array()
             .cloned()
@@ -955,11 +1065,7 @@ impl BiBackend for Metabase {
 
     async fn describe_dataset(&self, id: &str) -> Result<Dataset> {
         let body = self
-            .http
-            .get_json(
-                &format!("{}/api/table/{id}/query_metadata", self.base),
-                &self.headers(),
-            )
+            .get(&format!("{}/api/table/{id}/query_metadata", self.base))
             .await?;
         Ok(Dataset {
             id: id.to_string(),
@@ -1011,10 +1117,8 @@ impl BiBackend for Metabase {
 
     async fn chart_data(&self, chart_id: &str, _filters: &[Filter]) -> Result<Table> {
         let body = self
-            .http
-            .post_json(
+            .post(
                 &format!("{}/api/card/{chart_id}/query", self.base),
-                &self.headers(),
                 json!({}),
             )
             .await?;
@@ -1086,10 +1190,8 @@ impl BiBackend for Metabase {
         // real mistake. So resolve the table's own `db_id` first.
         let database = self.database_for_table(dataset_id).await?;
         let body = self
-            .http
-            .post_json(
+            .post(
                 &format!("{}/api/dataset", self.base),
-                &self.headers(),
                 json!({
                     "type": "native",
                     "native": { "query": sql },

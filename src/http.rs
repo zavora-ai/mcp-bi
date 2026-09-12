@@ -64,16 +64,57 @@ fn apply(
     request
 }
 
+/// The HTTP status of a failed call, attached so a caller can react to it.
+///
+/// The status is already in the error text, but reacting to a token expiry by matching
+/// on a message means a reworded message silently disables the recovery. This carries it
+/// as data. Metabase makes the case concrete: an expired session answers `401` with the
+/// bare body `Unauthenticated`, which is not JSON and says nothing a parser can use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpStatus(pub u16);
+
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP status {}", self.0)
+    }
+}
+
+impl std::error::Error for HttpStatus {}
+
+/// The status of a failed call, when it failed with one.
+#[must_use]
+pub fn status_of(error: &anyhow::Error) -> Option<u16> {
+    // anyhow's own downcast, not a walk over `chain()`. Iterating the chain yields the
+    // internal context wrapper as `&dyn Error`, whose concrete type is that wrapper
+    // rather than the value inside it, so `downcast_ref::<HttpStatus>()` on a chain
+    // element never matches. `Error::downcast_ref` knows to look at attached context.
+    error
+        .downcast_ref::<HttpStatus>()
+        .map(|HttpStatus(code)| *code)
+}
+
+/// True when a call failed because the credential was not accepted.
+///
+/// Both codes matter: a platform that has forgotten the session answers 401, and one
+/// that still knows it but has downgraded its rights answers 403. Re-authenticating is
+/// worth trying for either, since a fresh session is what would fix both.
+#[must_use]
+pub fn is_unauthorized(error: &anyhow::Error) -> bool {
+    matches!(status_of(error), Some(401 | 403))
+}
+
 /// A failed call reports the status and the body, because a BI platform's error
 /// body is usually the only thing that says which permission is missing.
 async fn json_or_error(response: reqwest::Response, url: &str) -> Result<Value> {
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(anyhow!(
-            "{url} returned HTTP {status}: {}",
-            text.chars().take(400).collect::<String>()
-        ));
+        return Err(
+            anyhow::Error::new(HttpStatus(status.as_u16())).context(format!(
+                "{url} returned HTTP {status}: {}",
+                text.chars().take(400).collect::<String>()
+            )),
+        );
     }
     if text.trim().is_empty() {
         return Ok(Value::Null);
@@ -124,7 +165,8 @@ impl Http for Reqwest {
             .to_string();
         let bytes = response.bytes().await?.to_vec();
         if !status.is_success() {
-            return Err(anyhow!("{url} returned HTTP {status}"));
+            return Err(anyhow::Error::new(HttpStatus(status.as_u16()))
+                .context(format!("{url} returned HTTP {status}")));
         }
         Ok((bytes, mime))
     }
@@ -144,6 +186,9 @@ pub struct Recorded {
     pub images: Vec<(String, Vec<u8>, String)>,
     /// Every request seen, so a test can assert on headers actually sent.
     pub seen: std::sync::Mutex<Vec<Seen>>,
+    /// Routes that answer 401 a set number of times before succeeding, so the
+    /// recovery path can be exercised without a platform to expire a session on.
+    lapsing: std::sync::Mutex<Vec<(String, usize)>>,
 }
 
 #[cfg(any(test, feature = "recorded-http"))]
@@ -156,6 +201,7 @@ impl Recorded {
                 .collect(),
             images: Vec::new(),
             seen: std::sync::Mutex::new(Vec::new()),
+            lapsing: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -165,7 +211,30 @@ impl Recorded {
         self
     }
 
+    /// Make a route answer 401 the first `times` requests, then succeed.
+    #[must_use]
+    pub fn lapsing_for(self, pattern: &str, times: usize) -> Self {
+        if let Ok(mut lapsing) = self.lapsing.lock() {
+            lapsing.push((pattern.to_string(), times));
+        }
+        self
+    }
+
     fn find(&self, url: &str) -> Result<Value> {
+        // A route registered as lapsing answers 401 the first time it is asked, exactly
+        // as a platform does when the session it was given has expired. That is the only
+        // way to test recovery, because a session id carries no expiry to fast-forward.
+        if let Ok(mut lapsing) = self.lapsing.lock()
+            && let Some(remaining) = lapsing
+                .iter_mut()
+                .find(|(pattern, remaining)| url.contains(pattern.as_str()) && *remaining > 0)
+                .map(|(_, remaining)| remaining)
+        {
+            *remaining -= 1;
+            return Err(anyhow::Error::new(HttpStatus(401)).context(format!(
+                "{url} returned HTTP 401 Unauthorized: Unauthenticated"
+            )));
+        }
         self.routes
             .iter()
             .find(|(pattern, _)| url.contains(pattern.as_str()))

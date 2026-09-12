@@ -86,7 +86,7 @@ fails with an error naming this remedy rather than passing along Superset's
 | Backend | Variables |
 |---|---|
 | `superset` | `SUPERSET_URL`, and either `SUPERSET_USERNAME` + `SUPERSET_PASSWORD` (preferred, self-refreshing) or `SUPERSET_TOKEN`. Optional `SUPERSET_AUTH_PROVIDER` (default `db`) |
-| `metabase` | `METABASE_URL`, `METABASE_TOKEN` |
+| `metabase` | `METABASE_URL`, and either `METABASE_USERNAME` + `METABASE_PASSWORD` (preferred — the server renews its own session) or `METABASE_TOKEN` |
 | `powerbi` | `POWERBI_TOKEN`, optional `POWERBI_GROUP_ID`, `POWERBI_API` |
 | `tableau` | `TABLEAU_URL`, `TABLEAU_TOKEN`, `TABLEAU_SITE_ID` |
 | `looker` | `LOOKER_URL`, `LOOKER_TOKEN` |
@@ -154,10 +154,41 @@ Three things that live testing corrected, and a reading of the docs would not:
 The fixture tests now encode these shapes, so a regression would be caught without
 Superset running.
 
+## Verified against a live Metabase
+
+```sh
+docker run -d --name metabase-bi -p 3000:3000 metabase/metabase:latest
+# Complete the setup wizard once, then add the bundled Sample Database.
+
+export METABASE_URL=http://localhost:3000
+export METABASE_USERNAME=you@example.invalid METABASE_PASSWORD=your-password
+
+python3 scripts/verify-metabase.py ./target/release/mcp-bi
+```
+
+All 28 checks pass against real Metabase content: a 36-chart dashboard, 8 datasets, live
+rows from a saved question, real SQL, and a 27 KB PNG drawn from those rows. It passes
+both with credentials and with a supplied `METABASE_TOKEN`.
+
+Two things live testing corrected here, and a reading of the docs would not:
+
+| Assumption | Reality |
+|---|---|
+| A dataset id can be used as the database to query | A Metabase dataset is a **table**, and a query runs against a *database*. Passing the table id through as `database` reached Metabase's driver code with an id from the wrong space and produced `500 Assert failed: (keyword? driver)`. The table's own `db_id` has to be resolved first |
+| A session token is enough | A Metabase session id is an opaque UUID with no readable expiry, so a lapse cannot be anticipated the way Superset's JWT `exp` can. The only reliable signal is the platform refusing it — `401` with the bare body `Unauthenticated`, which is not JSON. Recovery has to be reactive, so the server re-authenticates and retries once |
+
+Both are pinned by fixture tests, so a regression is caught without Metabase running.
+
 ## Not yet verified
 
-Metabase is tested against recorded responses following its documented API, not
-against a live instance. The five commercial adapters are mapped from published API
-references and have never run against a real tenant — treat their endpoint shapes as
-reviewed, not proven. Given what live testing corrected in Superset, expect at least
-one surprise per platform.
+The five commercial adapters — Power BI, Tableau, Looker, Qlik Sense and QuickSight —
+are mapped from published API references and have **never run against a real tenant**.
+Treat their endpoint shapes as reviewed, not proven.
+
+That caveat is worth taking literally. Live testing corrected three assumptions in
+Superset and two in Metabase, and in both cases the wrong version looked entirely
+reasonable against the documentation. Expect at least one such correction per platform.
+
+If you have a tenant, `scripts/verify-superset.py` and `scripts/verify-metabase.py` show
+the shape a verification takes — the same structure applied to a commercial backend would
+turn one of these from reviewed into proven, and a report of what it found is welcome.

@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.3.0] - 2026-09-13
+
+### Added — Metabase renews its own session
+Metabase previously took only `METABASE_TOKEN`, so a run that outlived its session
+failed partway through with `401 Unauthenticated` and nothing to do about it. It now
+also takes `METABASE_USERNAME` and `METABASE_PASSWORD`, and obtains a session itself.
+
+The mechanism differs from Superset's deliberately. A Superset access token is a JWT,
+so its expiry can be read from the token and a refresh timed to beat it. A Metabase
+session id is an opaque UUID carrying no expiry, so a lapse cannot be anticipated —
+the only reliable signal is the platform refusing it. Recovery is therefore reactive:
+a rejected request triggers one re-authentication and one retry. Retried exactly once,
+because a second failure means the credentials are wrong and retrying would turn a
+clear rejection into a loop.
+
+Measured against a live instance rather than read from the documentation:
+`POST /api/session` answers with exactly `{"id": "<uuid>"}`, and a rejected session
+answers `401` with the bare body `Unauthenticated` — not JSON, so nothing useful can
+be parsed from it.
+
+### Added — a failed call carries its status as data
+`http::status_of` and `http::is_unauthorized` read the HTTP status from an error
+directly. Recovery that depends on matching an error message breaks silently when the
+message is reworded, and Metabase's one-word body gives a parser nothing to work with.
+
+The status is attached as the error's cause rather than its context, so the readable
+message stays the headline — an earlier arrangement made every failure display as
+"HTTP status 401" and buried the platform's own explanation of which permission was
+missing.
+
+### Added — `scripts/verify-metabase.py`
+28 checks against a live Metabase over real MCP stdio, matching the Superset script.
+Includes asserting the *refusal* of `bi_export_dashboard_image`: Metabase renders
+dashboards client-side, so the honest answer is a structured error naming the limit
+rather than a blank or invented image.
+
+### Changed
+The README no longer claims Metabase is unverified against a live instance. It is, and
+the two corrections live testing produced are now recorded beside Superset's three.
+
 ## [0.2.0] - 2026-09-12
 
 ### Added — memory, so a correction is learned once

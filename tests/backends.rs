@@ -876,3 +876,104 @@ async fn memory_survives_a_restart() {
     let _ = std::fs::remove_dir_all(&dir);
     unsafe { std::env::remove_var("BI_MEMORY_PATH") };
 }
+
+// ── Metabase session renewal ────────────────────────────────────────────────
+//
+// Every shape below was measured against a live Metabase instance, not read from the
+// docs. Two facts drove the design: `POST /api/session` answers with exactly
+// `{"id": "<uuid>"}`, and a rejected session answers `401` with the bare body
+// `Unauthenticated` — not JSON, so nothing useful can be parsed out of it.
+
+#[tokio::test]
+async fn metabase_obtains_a_session_from_credentials() {
+    let http = Arc::new(Recorded::new(vec![
+        ("/api/session", json!({ "id": "fresh-session-uuid" })),
+        ("/api/dashboard", json!([{ "id": 1, "name": "Sales" }])),
+    ]));
+    let backend =
+        Metabase::with_login(http.clone(), "http://mb.invalid", "u@example.invalid", "pw");
+    let dashboards = backend.list_dashboards().await.expect("list dashboards");
+
+    assert_eq!(dashboards.len(), 1);
+    assert!(
+        http.called("/api/session"),
+        "it must log in when given no token"
+    );
+    assert!(
+        http.sent_header("X-Metabase-Session", "fresh-session-uuid"),
+        "and use the session it was issued"
+    );
+}
+
+#[tokio::test]
+async fn metabase_renews_a_lapsed_session_and_retries() {
+    // The failure this exists for: a run that outlives its session. The first request is
+    // rejected, exactly as Metabase rejects an expired session id, and the run continues.
+    let http = Arc::new(
+        Recorded::new(vec![
+            ("/api/session", json!({ "id": "second-session" })),
+            ("/api/dashboard", json!([{ "id": 7, "name": "Revenue" }])),
+        ])
+        .lapsing_for("/api/dashboard", 1),
+    );
+    let backend =
+        Metabase::with_login(http.clone(), "http://mb.invalid", "u@example.invalid", "pw");
+    let dashboards = backend
+        .list_dashboards()
+        .await
+        .expect("a lapsed session must be renewed, not surfaced as a failure");
+
+    assert_eq!(dashboards.len(), 1, "the retry returns the real answer");
+    assert!(
+        http.sent_header("X-Metabase-Session", "second-session"),
+        "the retry must use the renewed session"
+    );
+}
+
+#[tokio::test]
+async fn metabase_without_credentials_says_what_would_fix_it() {
+    // A bare 401 tells an operator nothing. With no way to recover, the error has to
+    // name the remedy rather than repeat the platform's one-word rejection.
+    let http = Arc::new(
+        Recorded::new(vec![("/api/dashboard", json!([]))]).lapsing_for("/api/dashboard", 1),
+    );
+    let backend = Metabase::new(http, "http://mb.invalid", "a-token-with-no-credentials");
+    let error = backend
+        .list_dashboards()
+        .await
+        .expect_err("a rejected session with no credentials cannot succeed");
+    let text = format!("{error:#}");
+
+    assert!(
+        text.contains("METABASE_USERNAME"),
+        "names the remedy: {text}"
+    );
+    assert!(
+        text.contains("METABASE_PASSWORD"),
+        "names both variables: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_call_carries_its_status_and_keeps_its_message() {
+    // Both halves matter. The status has to be readable as data so recovery does not
+    // depend on matching a message, and the message has to stay the headline so a
+    // permissions failure still says which permission.
+    use mcp_bi::http::{is_unauthorized, status_of};
+
+    let http = Arc::new(
+        Recorded::new(vec![("/api/dashboard", json!([]))]).lapsing_for("/api/dashboard", 1),
+    );
+    let backend = Metabase::new(http, "http://mb.invalid", "token");
+    let error = backend.list_dashboards().await.expect_err("must fail");
+
+    assert_eq!(
+        status_of(&error),
+        Some(401),
+        "the status is available as data"
+    );
+    assert!(
+        is_unauthorized(&error),
+        "and is recognised as an auth failure"
+    );
+}
