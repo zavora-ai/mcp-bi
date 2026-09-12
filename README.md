@@ -90,7 +90,7 @@ fails with an error naming this remedy rather than passing along Superset's
 | `powerbi` | `POWERBI_TOKEN` (obtain with `scripts/powerbi-token.py`), optional `POWERBI_GROUP_ID` for a workspace other than My Workspace, `POWERBI_API` |
 | `tableau` | `TABLEAU_URL`, `TABLEAU_TOKEN`, `TABLEAU_SITE_ID` |
 | `looker` | `LOOKER_URL`, `LOOKER_TOKEN` |
-| `qlik` | `QLIK_URL`, `QLIK_TOKEN` |
+| `qlik` | `QLIK_URL`, `QLIK_TOKEN` (Profile settings ▸ API keys). A dataset id is `{appId}:{tableName}` |
 | `quicksight` | `AWS_ACCOUNT_ID`, `QUICKSIGHT_TOKEN`, optional `AWS_REGION` |
 
 ## Rendering
@@ -211,17 +211,44 @@ alongside the successes — a backend that improvised numbers here would be wors
 that declines. `bi_query` with DAX is the route that works, and it works well: 45 survey
 responses grouped by block, by answer and by satisfaction, straight out of the model.
 
+## Verified against a live Qlik Cloud tenant
+
+```sh
+export QLIK_URL=https://your-tenant.eu.qlikcloud.com
+export QLIK_TOKEN=your-api-key      # Profile settings ▸ API keys ▸ Generate new key
+python3 scripts/verify-qlik.py ./target/release/mcp-bi
+```
+
+All 29 checks pass against a trial tenant: an app's three business tables with row counts
+of 632,313, 245 and 30, and a 14-field schema with types.
+
+This adapter refused **five of its seven methods**, all on one claim: that "Qlik apps are
+read through the Engine JSON API over a WebSocket, not REST". Live testing split that claim
+in half.
+
+| Assumption | Reality |
+|---|---|
+| Listing datasets is not possible over REST | `GET /api/v1/apps/{id}/data/metadata` returns the app's tables with row counts, and every field with its type tags. `bi_list_datasets` and `bi_describe_dataset` now work; the refusals were wrong rather than cautious |
+| Sheets and visuals are not possible over REST | **True, and now measured rather than assumed.** `/apps/{id}/objects` and `/apps/{id}/sheets` both answer `404`. `bi_chart_data`, `bi_drill_down` and `bi_insights` decline, and the verification asserts those refusals |
+| An app's title is its id | It presented itself as `a bare GUID`, the same defect the Power BI adapter had. `attributes.name` is one REST call away |
+| A numeric field is a measure, so not groupable | Not in Qlik. Its associative model makes **any** field selectable as a dimension, and the metadata carries nothing to infer a measure from: `Date_year` has 2 distinct values and `Quantity` has 3, so cardinality cannot separate them and there is no `SummarizeBy` equivalent to read. Marking `Date_year` ungroupable would stop an agent grouping by year on a sales model, so every field is reported groupable and `kind` carries the numeric signal instead |
+
+Two smaller shapes worth knowing: a dataset id is `{appId}:{tableName}`, because Qlik has no
+single object for a queryable table — an app holds tables, while `/items?resourceType=dataset`
+lists `.qvd` and `.txt` *files* with no schema endpoint. And Qlik's own bookkeeping is
+filtered out: tables flagged `is_system` (`$$SysTable 3`) and fields tagged `$system`
+(`$Field`, `$Table`, `$Rows`) describe the model rather than the business.
+
 ## Not yet verified
 
-Four commercial adapters — Tableau, Looker, Qlik Sense and QuickSight — are mapped from
-published API references and have **never run against a real tenant**. Treat their endpoint
-shapes as reviewed, not proven.
+Three commercial adapters — Tableau, Looker and QuickSight — are mapped from published API
+references and have **never run against a real tenant**. Treat their endpoint shapes as
+reviewed, not proven.
 
-Take that literally. Live testing corrected three assumptions in Superset, two in Metabase
-and five in Power BI, and in every case the wrong version looked entirely reasonable
-against the documentation. Power BI is the clearest warning: the adapter returned an
-HTTP 200 and an empty column list, which reads like a model with no columns rather than a
-broken query.
+Take that literally. Live testing has now corrected three assumptions in Superset, two in
+Metabase, five in Power BI and four in Qlik. In every case the wrong version looked
+reasonable against the documentation, and twice the failure was **silent**: Power BI
+returned HTTP 200 with an empty column list, and Qlik declined work it was capable of.
 
-If you have a tenant, the three verify scripts show the shape a check takes, and a report
-of what it finds is welcome.
+If you have a tenant, the four verify scripts show the shape a check takes, and a report of
+what it finds is welcome.

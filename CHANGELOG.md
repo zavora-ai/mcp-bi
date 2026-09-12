@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.5.0] - 2026-09-13
+
+### Changed — Qlik Cloud is verified against a live tenant
+The adapter refused five of its seven methods on a single claim: that "Qlik apps are read
+through the Engine JSON API over a WebSocket, not REST". Live testing split that claim in
+half, and the wrong half was costing real capability.
+
+**An app's data model is plain REST.** `GET /api/v1/apps/{id}/data/metadata` returns the
+tables with row counts and every field with its type tags. `bi_list_datasets` and
+`bi_describe_dataset` now work — measured on a trial tenant as three business tables of
+632,313, 245 and 30 rows, and a 14-field schema.
+
+**Sheets and visuals genuinely are not.** `/apps/{id}/objects` and `/apps/{id}/sheets` both
+answer 404. That limit is now measured rather than assumed, and the verification asserts the
+refusals of `bi_chart_data`, `bi_drill_down` and `bi_insights` alongside the successes.
+
+**An app described itself as a GUID**, the same defect the Power BI adapter had.
+`attributes.name` is one REST call away.
+
+**Every field is now reported as groupable**, contrary to the other adapters and
+deliberately so. Qlik's associative model makes any field selectable as a dimension, and the
+metadata carries nothing to infer a measure from: `Date_year` has 2 distinct values and
+`Quantity` has 3, so cardinality cannot separate them, and there is no `SummarizeBy`
+equivalent. Marking `Date_year` ungroupable would stop an agent grouping by year on a sales
+model. `kind` still carries the numeric signal.
+
+A dataset id is `{appId}:{tableName}`, because Qlik has no single object for a queryable
+table: an app holds tables, while `/items?resourceType=dataset` lists `.qvd` and `.txt`
+files with no schema endpoint of their own. Qlik's own bookkeeping is excluded — tables
+flagged `is_system` and fields tagged `$system` describe the model, not the business.
+
+### Added — `scripts/verify-qlik.py`
+29 checks against a live tenant over real MCP stdio, including that a wrong table name is
+refused by listing the tables that do exist rather than returning an empty column list.
+
 ## [0.4.0] - 2026-09-13
 
 ### Changed — Power BI is verified against a live tenant

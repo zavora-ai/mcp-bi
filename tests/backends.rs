@@ -18,7 +18,7 @@ use mcp_bi::memory::MemoryBackend;
 use mcp_bi::open_source::{Metabase, Superset};
 use mcp_bi::render;
 use mcp_bi::types::Filter;
-use mcp_bi::vendors::PowerBi;
+use mcp_bi::vendors::{PowerBi, Qlik};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -1137,4 +1137,198 @@ async fn powerbi_links_to_a_page_rather_than_an_embed_surface() {
     );
     assert!(!link.contains("Embed"), "and not an embed surface: {link}");
     assert!(!link.contains("reportId"), "and not a report link: {link}");
+}
+
+// ── Qlik Cloud ──────────────────────────────────────────────────────────────
+//
+// The adapter refused five of its seven methods on the grounds that "Qlik apps are read
+// through the Engine JSON API over a WebSocket, not REST". Live testing split that claim
+// in two: the *data model* is plain REST, and *sheets* genuinely are not. These tests pin
+// both halves.
+
+#[tokio::test]
+async fn qlik_lists_an_apps_tables_over_rest() {
+    // This used to answer "listing datasets over REST is not supported". The app metadata
+    // endpoint returns the tables, with row counts — measured on a live tenant as 632,313
+    // rows for Sales, 245 for Products, 30 for Stores.
+    let http = Arc::new(Recorded::new(vec![
+        (
+            "data/metadata",
+            json!({
+                "tables": [
+                    { "name": "Sales", "no_of_rows": 632_313, "is_system": false },
+                    { "name": "Products", "no_of_rows": 245, "is_system": false },
+                    { "name": "$$SysTable 3", "no_of_rows": 31, "is_system": true },
+                ],
+                "fields": []
+            }),
+        ),
+        (
+            "resourceType=app",
+            json!({ "data": [
+                { "resourceId": "app-1", "name": "Spark Electronics" }
+            ]}),
+        ),
+    ]));
+    let backend = Qlik::new(http, "https://tenant.eu.qlikcloud.com", "key");
+    let listed = backend.list_datasets().await.expect("list datasets");
+
+    assert_eq!(
+        listed.len(),
+        2,
+        "Qlik's own $$SysTable is not a dataset to analyse"
+    );
+    assert_eq!(listed[0].name, "Spark Electronics › Sales");
+    assert_eq!(
+        listed[0].id, "app-1:Sales",
+        "the id names both app and table"
+    );
+    assert_eq!(listed[0].row_count, Some(632_313));
+}
+
+#[tokio::test]
+async fn qlik_describes_a_table_with_types_from_field_tags() {
+    // Qlik states a field's type as tags rather than a type name, and marks its own model
+    // fields — $Field, $Table, $Rows — with $system.
+    let http = Arc::new(Recorded::new(vec![
+        (
+            "data/metadata",
+            json!({
+                "tables": [{ "name": "Sales", "no_of_rows": 632_313, "is_system": false }],
+                "fields": [
+                    { "name": "TransactionID", "tags": ["$text"], "src_tables": ["Sales"] },
+                    { "name": "Date", "tags": ["$numeric", "$integer", "$timestamp", "$date"],
+                      "src_tables": ["Sales"] },
+                    { "name": "Quantity", "tags": ["$numeric", "$integer"], "src_tables": ["Sales"] },
+                    { "name": "$Field", "tags": ["$text", "$system", "$hidden"], "src_tables": [] },
+                ]
+            }),
+        ),
+        (
+            "apps/app-1",
+            json!({ "attributes": { "name": "Spark Electronics" } }),
+        ),
+    ]));
+    let backend = Qlik::new(http, "https://tenant.eu.qlikcloud.com", "key");
+    let described = backend
+        .describe_dataset("app-1:Sales")
+        .await
+        .expect("describe");
+
+    let names: Vec<&str> = described.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["TransactionID", "Date", "Quantity"],
+        "$system fields excluded"
+    );
+    let kinds: Vec<&str> = described.columns.iter().map(|c| c.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec!["string", "time", "number"],
+        "$date beats $numeric"
+    );
+    assert_eq!(described.row_count, Some(632_313));
+    assert_eq!(described.name, "Spark Electronics › Sales");
+}
+
+#[tokio::test]
+async fn qlik_reports_every_field_as_groupable() {
+    // Deliberate, and contrary to the other adapters. Qlik's associative model makes any
+    // field selectable as a dimension, and the metadata carries nothing to infer a measure
+    // from: on a live app `Date_year` has 2 distinct values and `Quantity` has 3, so
+    // cardinality cannot separate them. Claiming a year is not groupable would stop an
+    // agent grouping by year on a sales model.
+    let http = Arc::new(Recorded::new(vec![
+        (
+            "data/metadata",
+            json!({
+                "tables": [{ "name": "Sales", "no_of_rows": 10, "is_system": false }],
+                "fields": [
+                    { "name": "Date_year", "tags": ["$numeric", "$integer"], "src_tables": ["Sales"] },
+                    { "name": "Quantity", "tags": ["$numeric", "$integer"], "src_tables": ["Sales"] },
+                ]
+            }),
+        ),
+        ("apps/app-1", json!({ "attributes": { "name": "App" } })),
+    ]));
+    let backend = Qlik::new(http, "https://tenant.eu.qlikcloud.com", "key");
+    let described = backend
+        .describe_dataset("app-1:Sales")
+        .await
+        .expect("describe");
+
+    assert!(
+        described.columns.iter().all(|c| c.groupable),
+        "every field is selectable in Qlik's model"
+    );
+    assert!(
+        described.columns.iter().all(|c| c.kind == "number"),
+        "while kind still says which are numbers"
+    );
+}
+
+#[tokio::test]
+async fn qlik_refuses_a_table_that_does_not_exist_by_listing_the_ones_that_do() {
+    // An empty column list would read as a table with no fields.
+    let http = Arc::new(Recorded::new(vec![(
+        "data/metadata",
+        json!({
+            "tables": [
+                { "name": "Sales", "no_of_rows": 1, "is_system": false },
+                { "name": "Stores", "no_of_rows": 1, "is_system": false },
+            ],
+            "fields": []
+        }),
+    )]));
+    let backend = Qlik::new(http, "https://tenant.eu.qlikcloud.com", "key");
+    let error = backend
+        .describe_dataset("app-1:Nope")
+        .await
+        .expect_err("a wrong table name must be refused");
+    let text = format!("{error:#}");
+
+    assert!(text.contains("Nope"), "names what was asked for: {text}");
+    assert!(
+        text.contains("Sales") && text.contains("Stores"),
+        "and what exists: {text}"
+    );
+}
+
+#[tokio::test]
+async fn qlik_names_an_app_rather_than_returning_its_id_as_a_title() {
+    // The same defect the Power BI adapter had: the title was the id, so every app
+    // presented itself as `a bare GUID`.
+    let http = Arc::new(Recorded::new(vec![
+        (
+            "data/metadata",
+            json!({
+                "tables": [{ "name": "Sales", "no_of_rows": 1, "is_system": false }],
+                "fields": []
+            }),
+        ),
+        (
+            "apps/app-1",
+            json!({ "attributes": {
+                "name": "Spark Electronics - Sales Dashboard",
+                "modifiedDate": "2026-09-01T10:00:00Z"
+            }}),
+        ),
+    ]));
+    let backend = Qlik::new(http, "https://tenant.eu.qlikcloud.com", "key");
+    let opened = backend.get_dashboard("app-1").await.expect("open");
+
+    assert_eq!(opened.title, "Spark Electronics - Sales Dashboard");
+    assert!(
+        opened.charts.is_empty(),
+        "sheets need the Engine API, so none are claimed"
+    );
+    let description = opened.description.unwrap_or_default();
+    assert!(
+        description.contains("bi_list_datasets"),
+        "the limit is stated alongside what does work: {description}"
+    );
+    assert!(
+        description.contains("Sales"),
+        "and the model is named: {description}"
+    );
 }

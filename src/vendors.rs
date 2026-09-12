@@ -1263,6 +1263,49 @@ impl Qlik {
             ("Accept".into(), "application/json".into()),
         ]
     }
+
+    /// A Qlik app's data model: its tables, their row counts, and every field's type tags.
+    ///
+    /// The adapter used to refuse anything to do with a model, on the grounds that "Qlik
+    /// apps are read through the Engine JSON API over a WebSocket, not REST". That is true
+    /// of *sheets and their visuals* — `/apps/{id}/objects` and `/apps/{id}/sheets` both
+    /// answer 404 — and not true of the data model, which this endpoint returns over plain
+    /// REST. Measured on a live tenant: 6 tables and 35 fields, with row counts of 632,313
+    /// for Sales, 245 for Products and 30 for Stores.
+    async fn model(&self, app_id: &str) -> Result<Value> {
+        self.http
+            .get_json(
+                &format!("{}/api/v1/apps/{app_id}/data/metadata", self.base),
+                &self.headers(),
+            )
+            .await
+            .with_context(|| format!("could not read the data model of Qlik app {app_id}"))
+    }
+
+    /// A dataset id names a table inside an app, because that is the pair a query needs.
+    ///
+    /// Qlik has no single "dataset" object corresponding to a queryable table: an app holds
+    /// tables, and the tenant separately holds data *files* under
+    /// `/items?resourceType=dataset` — which are `.qvd` and `.txt` artefacts with no schema
+    /// endpoint of their own. The useful thing to describe is a table in an app, so the id
+    /// carries both.
+    fn split_dataset_id(id: &str) -> (&str, Option<&str>) {
+        match id.split_once(':') {
+            Some((app, table)) if !table.is_empty() => (app, Some(table)),
+            _ => (id, None),
+        }
+    }
+
+    /// Qlik states a field's type as tags rather than a type name.
+    fn kind_of(tags: &[&str]) -> &'static str {
+        if tags.iter().any(|t| *t == "$timestamp" || *t == "$date") {
+            "time"
+        } else if tags.iter().any(|t| *t == "$numeric" || *t == "$integer") {
+            "number"
+        } else {
+            "string"
+        }
+    }
 }
 
 #[async_trait]
@@ -1278,11 +1321,22 @@ impl BiBackend for Qlik {
             export_image: false,
             deep_links: true,
             notes: vec![
-                "Qlik apps are read through the Engine JSON API over a WebSocket, not REST, so \
-                 only discovery and deep links are wired here."
+                "An app's data model is available over REST: bi_list_datasets reports its \
+                 tables with row counts, and bi_describe_dataset reports a table's fields \
+                 and their types."
                     .into(),
-                "For the numbers behind a visual, use the Engine API or open the sheet with \
+                "Sheets and their visuals are not. `/apps/{id}/objects` and \
+                 `/apps/{id}/sheets` answer 404 — they come from the Engine JSON API over a \
+                 WebSocket, which this adapter does not open — so bi_get_dashboard lists no \
+                 charts and bi_chart_data has nothing to read."
+                    .into(),
+                "For the numbers behind a visual, use the Engine API, or open the sheet with \
                  bi_dashboard_url and read it from the screen."
+                    .into(),
+                "Every field is reported as groupable. Qlik's associative model makes any \
+                 field selectable as a dimension, and the metadata carries nothing to infer \
+                 a measure from: on a live app `Date_year` has 2 distinct values and \
+                 `Quantity` has 3, so cardinality cannot tell them apart."
                     .into(),
             ],
         }
@@ -1332,27 +1386,240 @@ impl BiBackend for Qlik {
     }
 
     async fn get_dashboard(&self, id: &str) -> Result<Dashboard> {
+        // The app's own name, not its id. Returning the id as the title made every app
+        // present itself as `a bare GUID`, which is the same defect the Power BI
+        // adapter had, and it is one REST call away from being right.
+        let app = self
+            .http
+            .get_json(&format!("{}/api/v1/apps/{id}", self.base), &self.headers())
+            .await
+            .ok();
+        let attributes = app.as_ref().and_then(|app| app.get("attributes"));
+        let title = attributes
+            .and_then(|attributes| attributes.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or(id)
+            .to_string();
+
+        // Say what *is* reachable, not only what is not. Sheets genuinely need the Engine
+        // API — `/apps/{id}/objects` and `/apps/{id}/sheets` both answer 404 on a live
+        // tenant, so that limit is measured rather than assumed — but the data model behind
+        // them is plain REST, and naming the tools that reach it is more use to a caller
+        // than an apology.
+        let model = self.model(id).await.ok();
+        let tables: Vec<String> = model
+            .as_ref()
+            .and_then(|model| model.get("tables"))
+            .and_then(Value::as_array)
+            .map(|tables| {
+                tables
+                    .iter()
+                    .filter(|table| table.get("is_system").and_then(Value::as_bool) != Some(true))
+                    .filter_map(|table| table.get("name").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let description = if tables.is_empty() {
+            "A Qlik app's sheets and visuals come from the Engine JSON API over a WebSocket, \
+             which this adapter does not open. This app reports no data model either, which \
+             usually means it has never been reloaded."
+                .to_string()
+        } else {
+            format!(
+                "Sheets and their visuals come from the Engine JSON API over a WebSocket, which \
+                 this adapter does not open, so no charts are listed. The data model is \
+                 available over REST: {} table(s) — {}. Use bi_list_datasets and \
+                 bi_describe_dataset, and bi_dashboard_url to open the app.",
+                tables.len(),
+                tables.join(", ")
+            )
+        };
+
         Ok(Dashboard {
             id: id.to_string(),
-            title: id.to_string(),
-            description: Some(
-                "Qlik sheets and their objects come from the Engine JSON API over a WebSocket, \
-                 which this adapter does not open."
-                    .into(),
-            ),
+            title,
+            description: Some(description),
             charts: Vec::new(),
             filters: Vec::new(),
             url: Some(format!("{}/sense/app/{id}", self.base)),
-            modified_at: None,
+            modified_at: attributes
+                .and_then(|attributes| attributes.get("modifiedDate"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
         })
     }
 
     async fn list_datasets(&self) -> Result<Vec<Dataset>> {
-        Err(unsupported("qlik", "listing datasets over REST"))
+        // Each app's tables, which is what a query is written against. This used to refuse
+        // as "listing datasets over REST" being unsupported; the app metadata endpoint
+        // returns exactly this, so the refusal was wrong rather than cautious.
+        let apps = self
+            .http
+            .get_json(
+                &format!("{}/api/v1/items?resourceType=app", self.base),
+                &self.headers(),
+            )
+            .await?;
+        let mut listed = Vec::new();
+        for app in apps
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+        {
+            let Some(app_id) = app.get("resourceId").and_then(Value::as_str) else {
+                continue;
+            };
+            let app_name = app.get("name").and_then(Value::as_str).unwrap_or(app_id);
+            // One app failing should not hide the rest: a tenant can hold an app that has
+            // never been reloaded, and it has no model to report.
+            let Ok(model) = self.model(app_id).await else {
+                continue;
+            };
+            for table in model
+                .get("tables")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+            {
+                // Qlik's own bookkeeping tables — `$$SysTable 3` and friends — describe the
+                // model rather than the business, and are not something to analyse.
+                if table.get("is_system").and_then(Value::as_bool) == Some(true) {
+                    continue;
+                }
+                let Some(name) = table.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                listed.push(Dataset {
+                    id: format!("{app_id}:{name}"),
+                    name: format!("{app_name} › {name}"),
+                    schema: None,
+                    columns: Vec::new(),
+                    row_count: table.get("no_of_rows").and_then(Value::as_u64),
+                });
+            }
+        }
+        Ok(listed)
     }
 
-    async fn describe_dataset(&self, _id: &str) -> Result<Dataset> {
-        Err(unsupported("qlik", "describing a dataset over REST"))
+    async fn describe_dataset(&self, id: &str) -> Result<Dataset> {
+        let (app_id, wanted_table) = Self::split_dataset_id(id);
+        let model = self.model(app_id).await?;
+
+        let tables = model
+            .get("tables")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        // Name the table if one was asked for, and say so plainly when it is not there —
+        // an empty column list would read as a table that has no fields.
+        if let Some(wanted) = wanted_table {
+            let known: Vec<&str> = tables
+                .iter()
+                .filter(|table| table.get("is_system").and_then(Value::as_bool) != Some(true))
+                .filter_map(|table| table.get("name").and_then(Value::as_str))
+                .collect();
+            if !known.contains(&wanted) {
+                bail!(
+                    "Qlik app {app_id} has no table named `{wanted}`. It holds: {}",
+                    known.join(", ")
+                )
+            }
+        }
+
+        let row_count = tables
+            .iter()
+            .find(|table| {
+                wanted_table
+                    .is_none_or(|wanted| table.get("name").and_then(Value::as_str) == Some(wanted))
+            })
+            .and_then(|table| table.get("no_of_rows").and_then(Value::as_u64));
+
+        let columns = model
+            .get("fields")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|field| {
+                let tags: Vec<&str> = field
+                    .get("tags")
+                    .and_then(Value::as_array)
+                    .map(|tags| tags.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                // `$system` and `$hidden` mark Qlik's internal model fields — `$Field`,
+                // `$Table`, `$Rows` — which exist in every app and describe nothing about
+                // the data. Six of this app's 35 fields were these.
+                if tags
+                    .iter()
+                    .any(|tag| *tag == "$system" || *tag == "$hidden")
+                {
+                    return None;
+                }
+                let sources: Vec<&str> = field
+                    .get("src_tables")
+                    .and_then(Value::as_array)
+                    .map(|tables| tables.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                // A key field belongs to several tables, so a request for one table keeps
+                // the keys that reach it.
+                if let Some(wanted) = wanted_table
+                    && !sources.contains(&wanted)
+                {
+                    return None;
+                }
+                let kind = Self::kind_of(&tags);
+                Some(Column {
+                    name: field.get("name").and_then(Value::as_str)?.to_string(),
+                    kind: kind.into(),
+                    // Every field, including a numeric one.
+                    //
+                    // Other backends infer "numeric means measure", and that inference is
+                    // wrong here for two reasons. Qlik's associative model makes any field
+                    // selectable as a dimension — that is the product's central idea, and a
+                    // visualisation decides what aggregates, not the model. And the
+                    // metadata carries nothing to infer from even if it were appropriate:
+                    // measured on a live app, `Date_year` has 2 distinct values and
+                    // `Quantity` has 3, so cardinality cannot separate the dimension from
+                    // the measure. There is no `SummarizeBy` equivalent to read.
+                    //
+                    // Claiming `groupable: false` for `Date_year` would stop an agent
+                    // grouping by year on a sales model, which is the first thing anyone
+                    // would ask for. `kind` still says which fields are numbers, so a
+                    // caller can pick sensible measures without being told a falsehood
+                    // about what may be grouped.
+                    groupable: true,
+                })
+            })
+            .collect();
+
+        let app_name = self
+            .http
+            .get_json(
+                &format!("{}/api/v1/apps/{app_id}", self.base),
+                &self.headers(),
+            )
+            .await
+            .ok()
+            .and_then(|app| {
+                app.get("attributes")?
+                    .get("name")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| app_id.to_string());
+
+        Ok(Dataset {
+            id: id.to_string(),
+            name: match wanted_table {
+                Some(table) => format!("{app_name} › {table}"),
+                None => app_name,
+            },
+            schema: None,
+            columns,
+            row_count,
+        })
     }
 
     async fn chart_data(&self, _chart_id: &str, _filters: &[Filter]) -> Result<Table> {
