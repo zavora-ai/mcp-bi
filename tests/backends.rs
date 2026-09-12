@@ -15,7 +15,7 @@
 use mcp_bi::backend::{BiBackend, Selection};
 use mcp_bi::http::Recorded;
 use mcp_bi::memory::MemoryBackend;
-use mcp_bi::open_source::Superset;
+use mcp_bi::open_source::{Metabase, Superset};
 use mcp_bi::render;
 use mcp_bi::types::Filter;
 use serde_json::json;
@@ -620,4 +620,75 @@ async fn a_non_jwt_token_is_trusted_because_only_the_server_can_judge_it() {
         .list_dashboards()
         .await
         .expect("an unparseable token should still be presented");
+}
+
+// ---------------------------------------------------------------------------
+// Metabase has two id spaces: a table id, which is what bi_list_datasets
+// reports, and a database id, which is what a query runs against. Conflating
+// them produced `HTTP 500 Assert failed: (keyword? driver)` from a live
+// instance — Metabase failing to resolve a driver for a database that does not
+// exist — which says nothing about the actual mistake.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_metabase_query_runs_against_the_table_s_database_not_its_own_id() {
+    let http = Arc::new(Recorded::new(vec![
+        // The table knows which database it belongs to.
+        (
+            "/api/table/2",
+            json!({ "id": 2, "name": "PRODUCTS", "db_id": 1 }),
+        ),
+        (
+            "/api/dataset",
+            json!({
+                "data": {
+                    "cols": [{ "display_name": "CATEGORY" }, { "display_name": "n" }],
+                    "rows": [["Widget", 54]],
+                }
+            }),
+        ),
+    ]));
+    let metabase = Metabase::new(http.clone(), "http://metabase.test", "session-token");
+    let table = metabase
+        .query(
+            "2",
+            "SELECT CATEGORY, COUNT(*) AS n FROM PRODUCTS GROUP BY CATEGORY",
+            100,
+        )
+        .await
+        .expect("the query should run");
+    assert_eq!(table.rows.len(), 1);
+
+    let seen = http.seen.lock().unwrap();
+    assert!(
+        seen[0].0.contains("/api/table/2"),
+        "the table is resolved first: {}",
+        seen[0].0
+    );
+    let body = seen[1].2.as_ref().expect("the query carries a body");
+    assert_eq!(
+        body.get("database").and_then(|value| value.as_i64()),
+        Some(1),
+        "the database must come from the table's db_id, not from the dataset id"
+    );
+}
+
+#[tokio::test]
+async fn an_id_that_is_not_a_table_says_so_rather_than_guessing_a_database() {
+    // The old code fell back to database 1 for anything unparseable, which turned a
+    // caller's mistake into a query against a database they never named.
+    let http = Arc::new(Recorded::new(vec![(
+        "/api/table/not-a-table",
+        json!({ "id": 99, "name": "X" }),
+    )]));
+    let metabase = Metabase::new(http, "http://metabase.test", "session-token");
+    let error = metabase
+        .query("not-a-table", "SELECT 1", 10)
+        .await
+        .expect_err("a table with no db_id cannot be queried")
+        .to_string();
+    assert!(
+        error.contains("db_id"),
+        "should name what is missing: {error}"
+    );
 }

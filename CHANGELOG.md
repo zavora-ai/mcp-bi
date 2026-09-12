@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.2] - 2026-09-12
+
+### Fixed — Metabase queries ran against the wrong id space
+`bi_query` passed the dataset id straight through as the `database` field of
+`/api/dataset`. Metabase's datasets are **tables**, whose ids are unrelated to
+database ids, so a valid dataset id produced
+`HTTP 500 Assert failed: (keyword? driver)` — Metabase failing to resolve a driver
+for a database that does not exist. The message named neither the cause nor the
+remedy, and a live agent hit it on a dataset id it had read from
+`bi_list_datasets` moments earlier.
+
+The table's own `db_id` is now resolved before the query runs, and an id that is
+not a table fails with a message saying so instead of silently falling back to
+database 1. 38 tests (12 unit + 22 integration + 4 manifest).
+
 ## [0.1.1] - 2026-09-11
 
 ### Fixed — a session no longer dies when the token does

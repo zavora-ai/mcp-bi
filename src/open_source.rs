@@ -780,6 +780,35 @@ impl Metabase {
         }
     }
 
+    /// Resolve which database a table belongs to.
+    ///
+    /// `bi_list_datasets` reports Metabase tables, but a query is run against a
+    /// database. The table knows its own `db_id`, so ask it rather than guessing —
+    /// the previous code passed the table id straight through as the database, which
+    /// worked only when the two happened to coincide.
+    async fn database_for_table(&self, table_id: &str) -> Result<i64> {
+        let table = self
+            .http
+            .get_json(
+                &format!("{}/api/table/{table_id}", self.base),
+                &self.headers(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "Could not read Metabase table {table_id}. Pass a dataset id from                      bi_list_datasets; a database id or a chart id will not work here."
+                )
+            })?;
+        table
+            .get("db_id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Metabase table {table_id} reports no db_id, so there is no database to                      query. This usually means the id belongs to something other than a table."
+                )
+            })
+    }
+
     /// Metabase uses its own header rather than `Authorization`.
     fn headers(&self) -> Vec<(String, String)> {
         vec![
@@ -1049,6 +1078,13 @@ impl BiBackend for Metabase {
     }
 
     async fn query(&self, dataset_id: &str, sql: &str, limit: usize) -> Result<Table> {
+        // Metabase has two id spaces and they are easy to confuse: a *table* id, which
+        // is what `bi_list_datasets` returns, and a *database* id, which is what
+        // `/api/dataset` wants. Sending a table id as `database` yields
+        // `HTTP 500 Assert failed: (keyword? driver)` — Metabase failing to resolve a
+        // driver for a database that does not exist — which says nothing about the
+        // real mistake. So resolve the table's own `db_id` first.
+        let database = self.database_for_table(dataset_id).await?;
         let body = self
             .http
             .post_json(
@@ -1057,10 +1093,17 @@ impl BiBackend for Metabase {
                 json!({
                     "type": "native",
                     "native": { "query": sql },
-                    "database": dataset_id.parse::<i64>().unwrap_or(1),
+                    "database": database,
                 }),
             )
-            .await?;
+            .await
+            .with_context(|| {
+                format!(
+                    "Metabase rejected the query against database {database} (from dataset \
+                     {dataset_id}). If the message mentions a driver assertion, the database id \
+                     is wrong; list datasets again and use one of those ids."
+                )
+            })?;
         let data = body.get("data").unwrap_or(&body);
         let columns: Vec<String> = data
             .get("cols")

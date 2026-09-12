@@ -1,6 +1,6 @@
 server_id = "mcp_bi"
 display_name = "Business Intelligence"
-version = "0.1.1"
+version = "0.1.2"
 domain = "analytics"
 sdk_version = "0.1.0"
 risk_level = "low"
