@@ -18,6 +18,7 @@ use mcp_bi::memory::MemoryBackend;
 use mcp_bi::open_source::{Metabase, Superset};
 use mcp_bi::render;
 use mcp_bi::types::Filter;
+use mcp_bi::vendors::PowerBi;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -976,4 +977,164 @@ async fn a_failed_call_carries_its_status_and_keeps_its_message() {
         is_unauthorized(&error),
         "and is recognised as an auth failure"
     );
+}
+
+// ── Microsoft Power BI ──────────────────────────────────────────────────────
+//
+// Every shape below was confirmed against a live Power BI tenant, and each test pins
+// something a plausible reading of the documentation gets wrong.
+
+#[tokio::test]
+async fn powerbi_lists_dashboards_as_well_as_reports() {
+    // The adapter used to list only reports, on the reasoning that "reports are what
+    // people mean by a dashboard". Against a real tenant that hid the artefact its owner
+    // called their dashboard: the report's pages were "Page 1" to "Page 5", while the
+    // dashboard beside it held 14 tiles named after what they measure.
+    let http = Arc::new(Recorded::new(vec![
+        (
+            "/dashboards",
+            json!({ "value": [
+                { "id": "dash-1", "displayName": "Water Survey",
+                  "webUrl": "https://app.powerbi.com/groups/me/dashboards/dash-1" }
+            ]}),
+        ),
+        (
+            "/reports",
+            json!({ "value": [
+                { "id": "rep-1", "name": "Water Survey",
+                  "webUrl": "https://app.powerbi.com/groups/me/reports/rep-1" }
+            ]}),
+        ),
+    ]));
+    let backend = PowerBi::new(http, "https://api.powerbi.com/v1.0/myorg", "token", None);
+    let listed = backend.list_dashboards().await.expect("list");
+
+    assert_eq!(listed.len(), 2, "both artefacts must be offered");
+    let kinds: Vec<&str> = listed
+        .iter()
+        .map(|d| d.description.as_deref().unwrap_or(""))
+        .collect();
+    assert!(
+        kinds.iter().any(|k| k.contains("pinned tiles")),
+        "{kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|k| k.contains("pages of visuals")),
+        "{kinds:?}"
+    );
+}
+
+#[tokio::test]
+async fn powerbi_describes_a_dataset_by_name_not_by_id() {
+    // `name` was filled with the id, so every semantic model described itself as a GUID.
+    // Visible the moment it ran against a tenant, where bi_list_datasets said
+    // "Water Survey" and bi_describe_dataset said "a bare GUID" for the same model.
+    // The query route is listed first deliberately: this fixture matches by substring and
+    // returns the first hit, so `datasets/ds-1/executeQueries` would otherwise be answered
+    // by the `datasets/ds-1` route.
+    let http = Arc::new(Recorded::new(vec![
+        (
+            "executeQueries",
+            json!({ "results": [{ "tables": [{ "rows": [
+                { "[name]": "Block", "[kind]": "Text", "[hidden]": false },
+                { "[name]": "Responses", "[kind]": "Integer", "[hidden]": false },
+                { "[name]": "RowNumber-2662979B", "[kind]": "Integer", "[hidden]": true },
+            ]}]}]}),
+        ),
+        (
+            "datasets/ds-1",
+            json!({ "id": "ds-1", "name": "Water Survey" }),
+        ),
+    ]));
+    let backend = PowerBi::new(http, "https://api.powerbi.com/v1.0/myorg", "token", None);
+    let described = backend.describe_dataset("ds-1").await.expect("describe");
+
+    assert_eq!(
+        described.name, "Water Survey",
+        "the model's name, not its id"
+    );
+    let names: Vec<&str> = described.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["Block", "Responses"],
+        "hidden bookkeeping is excluded"
+    );
+    let kinds: Vec<&str> = described.columns.iter().map(|c| c.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec!["string", "number"],
+        "friendly DAX type names are mapped"
+    );
+}
+
+#[tokio::test]
+async fn powerbi_reads_dax_columns_by_name_rather_than_position() {
+    // The trap underneath the previous test. A DAX result is a JSON object, so the order
+    // its columns arrive in is not the order the query asked for. Here `hidden` is
+    // deliberately serialized first: code indexing row[0] as the name would read a
+    // boolean, produce nothing, and look like a model with no columns.
+    let http = Arc::new(Recorded::new(vec![
+        (
+            "executeQueries",
+            json!({ "results": [{ "tables": [{ "rows": [
+                { "[hidden]": false, "[kind]": "Text", "[name]": "Floor" },
+            ]}]}]}),
+        ),
+        ("datasets/ds-2", json!({ "id": "ds-2", "name": "Ordered" })),
+    ]));
+    let backend = PowerBi::new(http, "https://api.powerbi.com/v1.0/myorg", "token", None);
+    let described = backend.describe_dataset("ds-2").await.expect("describe");
+
+    assert_eq!(described.columns.len(), 1);
+    assert_eq!(
+        described.columns[0].name, "Floor",
+        "found by alias, not by index"
+    );
+}
+
+#[tokio::test]
+async fn powerbi_says_when_a_models_shape_cannot_be_read() {
+    // The failure used to be swallowed into an empty column list, which reads as "this
+    // model has no columns" — and hid that the metadata function it used, INFO.COLUMNS(),
+    // answers HTTP 400 on a live tenant.
+    let http = Arc::new(Recorded::new(vec![(
+        "datasets/ds-3",
+        json!({ "id": "ds-3", "name": "Opaque" }),
+    )]));
+    let backend = PowerBi::new(http, "https://api.powerbi.com/v1.0/myorg", "token", None);
+    let error = backend
+        .describe_dataset("ds-3")
+        .await
+        .expect_err("no metadata must be an error, not an empty answer");
+    let text = format!("{error:#}");
+
+    assert!(text.contains("Opaque"), "names the model: {text}");
+    assert!(
+        text.contains("INFO.VIEW.COLUMNS"),
+        "names what was tried: {text}"
+    );
+}
+
+#[tokio::test]
+async fn powerbi_links_to_a_page_rather_than_an_embed_surface() {
+    // Power BI gives `webUrl` two meanings under one name. Measured:
+    //   GET /dashboards      → webUrl = …/groups/me/dashboards/{id}      (a page)
+    //   GET /dashboards/{id} → webUrl = …/dashboardEmbed?dashboardId=…   (an embed)
+    // Only the list form is something to hand a person, so the list is what is asked.
+    let http = Arc::new(Recorded::new(vec![(
+        "/dashboards",
+        json!({ "value": [
+            { "id": "dash-9", "displayName": "Water Survey",
+              "webUrl": "https://app.powerbi.com/groups/me/dashboards/dash-9" }
+        ]}),
+    )]));
+    let backend = PowerBi::new(http, "https://api.powerbi.com/v1.0/myorg", "token", None);
+    let link = backend.deep_link("dash-9", &[]).await.expect("link");
+
+    assert!(
+        link.contains("/dashboards/dash-9"),
+        "a dashboard link: {link}"
+    );
+    assert!(!link.contains("Embed"), "and not an embed surface: {link}");
+    assert!(!link.contains("reportId"), "and not a report link: {link}");
 }

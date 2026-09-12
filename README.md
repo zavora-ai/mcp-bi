@@ -87,7 +87,7 @@ fails with an error naming this remedy rather than passing along Superset's
 |---|---|
 | `superset` | `SUPERSET_URL`, and either `SUPERSET_USERNAME` + `SUPERSET_PASSWORD` (preferred, self-refreshing) or `SUPERSET_TOKEN`. Optional `SUPERSET_AUTH_PROVIDER` (default `db`) |
 | `metabase` | `METABASE_URL`, and either `METABASE_USERNAME` + `METABASE_PASSWORD` (preferred — the server renews its own session) or `METABASE_TOKEN` |
-| `powerbi` | `POWERBI_TOKEN`, optional `POWERBI_GROUP_ID`, `POWERBI_API` |
+| `powerbi` | `POWERBI_TOKEN` (obtain with `scripts/powerbi-token.py`), optional `POWERBI_GROUP_ID` for a workspace other than My Workspace, `POWERBI_API` |
 | `tableau` | `TABLEAU_URL`, `TABLEAU_TOKEN`, `TABLEAU_SITE_ID` |
 | `looker` | `LOOKER_URL`, `LOOKER_TOKEN` |
 | `qlik` | `QLIK_URL`, `QLIK_TOKEN` |
@@ -179,16 +179,49 @@ Two things live testing corrected here, and a reading of the docs would not:
 
 Both are pinned by fixture tests, so a regression is caught without Metabase running.
 
+## Verified against a live Power BI tenant
+
+The first commercial backend proven rather than reviewed.
+
+```sh
+export POWERBI_TOKEN=$(python3 scripts/powerbi-token.py)   # device code, no app registration
+python3 scripts/verify-powerbi.py ./target/release/mcp-bi
+```
+
+All 32 checks pass against a real tenant: a dashboard with 14 named tiles, a report with 5
+pages, a 19-column semantic model, and real DAX. `scripts/powerbi-token.py` signs in by
+device code against a Microsoft first-party public client that is already pre-authorised
+for the Power BI API, so it needs nothing registered in your tenant and grants nothing your
+own account cannot already do.
+
+Five things live testing corrected, and a reading of the docs would not:
+
+| Assumption | Reality |
+|---|---|
+| Reports are what people mean by a dashboard | Power BI has both, and only listing reports hid the artefact its owner called their dashboard. The report's pages were named "Page 1" to "Page 5"; the dashboard beside it held **14 tiles** named "No. of Houses with Water", "Satisfied with Water Services", "Responses". `bi_list_dashboards` now returns both, labelled, and `bi_get_dashboard` returns tiles or pages depending on which the id names |
+| `INFO.COLUMNS()` reads a model's schema | `HTTP 400 DatasetExecuteQueriesError — "Failed to execute the DAX query."` with error code 3239575574 and no further explanation. `INFO.VIEW.COLUMNS()` works and additionally reports `IsHidden`, which matters: a real model carried 9 hidden columns out of 28, including two `RowNumber-…` internals and a hidden date table |
+| A DAX result's columns arrive in the order the query asked for | They arrive as a JSON object, and with `serde_json`'s default map they came back **alphabetically** — `SELECTCOLUMNS(… "name" … "kind" … "hidden" …)` returned `["[hidden]", "[kind]", "[name]"]`. Positional access therefore read the wrong field. Fixed at both ends: aliases are looked up by name, and `preserve_order` keeps the query's order |
+| `webUrl` is the page to open | It means two different things under one name. `GET /dashboards` reports `…/groups/me/dashboards/{id}`, a page; `GET /dashboards/{id}` reports `…/dashboardEmbed?dashboardId=…&config=…`, a chrome-less embed surface for hosting inside another application |
+| Export produces an image given the right permissions | `403 InvalidRequest — "Export report to image is disabled on tenant level"`. An administrator setting, not a permission on the account, so no retry or grant changes it. The refusal now names the setting and points at `bi_dashboard_url` |
+
+What Power BI genuinely cannot do: **its REST API exposes no endpoint returning the data
+behind a tile or a page.** `bi_chart_data`, `bi_insights`, `bi_drill_down` and
+`bi_render_chart` therefore decline, and the verification script asserts those refusals
+alongside the successes — a backend that improvised numbers here would be worse than one
+that declines. `bi_query` with DAX is the route that works, and it works well: 45 survey
+responses grouped by block, by answer and by satisfaction, straight out of the model.
+
 ## Not yet verified
 
-The five commercial adapters — Power BI, Tableau, Looker, Qlik Sense and QuickSight —
-are mapped from published API references and have **never run against a real tenant**.
-Treat their endpoint shapes as reviewed, not proven.
+Four commercial adapters — Tableau, Looker, Qlik Sense and QuickSight — are mapped from
+published API references and have **never run against a real tenant**. Treat their endpoint
+shapes as reviewed, not proven.
 
-That caveat is worth taking literally. Live testing corrected three assumptions in
-Superset and two in Metabase, and in both cases the wrong version looked entirely
-reasonable against the documentation. Expect at least one such correction per platform.
+Take that literally. Live testing corrected three assumptions in Superset, two in Metabase
+and five in Power BI, and in every case the wrong version looked entirely reasonable
+against the documentation. Power BI is the clearest warning: the adapter returned an
+HTTP 200 and an empty column list, which reads like a model with no columns rather than a
+broken query.
 
-If you have a tenant, `scripts/verify-superset.py` and `scripts/verify-metabase.py` show
-the shape a verification takes — the same structure applied to a commercial backend would
-turn one of these from reviewed into proven, and a report of what it found is welcome.
+If you have a tenant, the three verify scripts show the shape a check takes, and a report
+of what it finds is welcome.

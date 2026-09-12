@@ -25,7 +25,7 @@ use crate::http::Http;
 use crate::types::{
     Capabilities, ChartRef, Column, Dashboard, Dataset, DrillResult, Filter, Table,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -136,19 +136,69 @@ impl BiBackend for PowerBi {
     }
 
     async fn list_dashboards(&self) -> Result<Vec<Dashboard>> {
-        // Reports are what people mean by a dashboard in Power BI; the Dashboards
-        // API covers the older pinned-tile artefact.
+        // Both artefacts, because Power BI has two and a person means either.
+        //
+        // The comment this replaces asserted that "reports are what people mean by a
+        // dashboard; the Dashboards API covers the older pinned-tile artefact", and
+        // listed only reports. Against a real tenant that hid the thing the owner
+        // called their dashboard: the report's pages were named "Page 1", "Page 2",
+        // "Page 3", while the dashboard beside it held 14 tiles named
+        // "No. of Houses with Water", "Satisfied with Water Services", "Responses".
+        // An agent choosing what to look at needs the second set.
+        let mut listed = Vec::new();
+
+        // Dashboards first, so the named tiles lead.
+        if let Ok(body) = self
+            .http
+            .get_json(&self.scope("dashboards"), &self.headers())
+            .await
+        {
+            for dashboard in body
+                .get("value")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+            {
+                listed.push(Dashboard {
+                    id: dashboard
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    title: dashboard
+                        .get("displayName")
+                        .and_then(Value::as_str)
+                        .unwrap_or("(untitled)")
+                        .to_string(),
+                    // Power BI carries no description on a dashboard, so the kind goes
+                    // here: an agent has to know a tile collection behaves differently
+                    // from a report's pages.
+                    description: Some("Power BI dashboard (pinned tiles)".to_string()),
+                    charts: Vec::new(),
+                    filters: Vec::new(),
+                    url: dashboard
+                        .get("webUrl")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    modified_at: None,
+                });
+            }
+        }
+
+        // Reports second. A failure here is worth surfacing, since a tenant with no
+        // dashboards and no readable reports is a configuration problem rather than an
+        // empty account.
         let body = self
             .http
             .get_json(&self.scope("reports"), &self.headers())
             .await?;
-        Ok(body
+        for report in body
             .get("value")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default()
-            .iter()
-            .map(|report| Dashboard {
+        {
+            listed.push(Dashboard {
                 id: report
                     .get("id")
                     .and_then(Value::as_str)
@@ -162,7 +212,8 @@ impl BiBackend for PowerBi {
                 description: report
                     .get("description")
                     .and_then(Value::as_str)
-                    .map(str::to_string),
+                    .map(str::to_string)
+                    .or_else(|| Some("Power BI report (pages of visuals)".to_string())),
                 charts: Vec::new(),
                 filters: Vec::new(),
                 url: report
@@ -170,11 +221,81 @@ impl BiBackend for PowerBi {
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 modified_at: None,
-            })
-            .collect())
+            });
+        }
+        Ok(listed)
     }
 
     async fn get_dashboard(&self, id: &str) -> Result<Dashboard> {
+        // A Power BI id could name either artefact, and the caller should not have to
+        // know which. Tiles are asked for first because they are the more useful answer
+        // when they exist: a real dashboard here returned 14 tiles named after what they
+        // measure, while the report beside it had three pages named "Page 1" to "Page 3".
+        if let Ok(tiles) = self
+            .http
+            .get_json(
+                &self.scope(&format!("dashboards/{id}/tiles")),
+                &self.headers(),
+            )
+            .await
+        {
+            let tiles = tiles
+                .get("value")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if !tiles.is_empty() {
+                let title = self
+                    .http
+                    .get_json(&self.scope(&format!("dashboards/{id}")), &self.headers())
+                    .await
+                    .ok()
+                    .and_then(|body| {
+                        body.get("displayName")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| "(untitled)".to_string());
+                return Ok(Dashboard {
+                    id: id.to_string(),
+                    title,
+                    description: Some(format!(
+                        "Power BI dashboard with {} pinned tiles. A tile's underlying query is \
+                         not exposed by the REST API — use bi_query with DAX against the tile's \
+                         dataset to get numbers.",
+                        tiles.len()
+                    )),
+                    charts: tiles
+                        .iter()
+                        .map(|tile| ChartRef {
+                            id: tile
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            // A tile pinned from a whole report page carries no title.
+                            // Saying so beats an empty string, which reads as a bug.
+                            title: tile
+                                .get("title")
+                                .and_then(Value::as_str)
+                                .unwrap_or("(untitled tile)")
+                                .to_string(),
+                            kind: "tile".into(),
+                            dataset_id: tile
+                                .get("datasetId")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            dimensions: Vec::new(),
+                            metrics: Vec::new(),
+                        })
+                        .collect(),
+                    filters: Vec::new(),
+                    url: Some(format!("https://app.powerbi.com/dashboards/{id}")),
+                    modified_at: None,
+                });
+            }
+        }
+
         let report = self
             .http
             .get_json(&self.scope(&format!("reports/{id}")), &self.headers())
@@ -261,34 +382,124 @@ impl BiBackend for PowerBi {
     }
 
     async fn describe_dataset(&self, id: &str) -> Result<Dataset> {
-        // A semantic model's shape comes from DAX over the model's own metadata,
-        // which is the only route the REST API offers without XMLA.
-        let table = self
-            .query(id, "EVALUATE SELECTCOLUMNS(INFO.COLUMNS(), \"name\", [ExplicitName], \"kind\", [DataType])", 500)
+        // The name comes from the dataset itself. It used to be filled with the id,
+        // which meant every semantic model described itself as a GUID — visible the
+        // moment this ran against a real tenant, where `bi_list_datasets` reported
+        // "Water Survey" and `bi_describe_dataset` reported
+        // "a-dataset-guid" for the same thing.
+        let name = self
+            .http
+            .get_json(&self.scope(&format!("datasets/{id}")), &self.headers())
             .await
-            .unwrap_or(Table { columns: vec![], rows: vec![], truncated: false });
+            .ok()
+            .and_then(|body| body.get("name").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_else(|| id.to_string());
+
+        // A semantic model's shape comes from DAX over the model's own metadata, which
+        // is the only route the REST API offers without XMLA. Which metadata function
+        // works is not a matter of documentation:
+        //
+        //   INFO.COLUMNS()      → HTTP 400 "Failed to execute the DAX query." on a live
+        //                         tenant, with error code 3239575574 and no explanation
+        //   INFO.VIEW.COLUMNS() → 28 rows, with friendly type names and IsHidden
+        //
+        // The first is what this adapter shipped with, so it returned nothing at all.
+        // Tried in order of usefulness, because availability varies by model and by
+        // engine version, and a caller wants columns rather than a lecture.
+        let attempts = [
+            "EVALUATE SELECTCOLUMNS(INFO.VIEW.COLUMNS(), \"name\", [Name], \"kind\", [DataType], \
+             \"hidden\", [IsHidden])",
+            "EVALUATE SELECTCOLUMNS(INFO.COLUMNS(), \"name\", [ExplicitName], \"kind\", [DataType])",
+            "EVALUATE SELECTCOLUMNS(COLUMNSTATISTICS(), \"name\", [Column Name])",
+        ];
+        let mut table = None;
+        let mut last_error = None;
+        for dax in attempts {
+            match self.query(id, dax, 500).await {
+                Ok(found) if !found.rows.is_empty() => {
+                    table = Some(found);
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => last_error = Some(error),
+            }
+        }
+        // Say so rather than returning an empty column list, which reads as "this model
+        // has no columns" and is the thing that hid the broken query in the first place.
+        let table = match table {
+            Some(table) => table,
+            None => {
+                let detail = last_error
+                    .map(|error| format!("{error:#}"))
+                    .unwrap_or_else(|| "every metadata query returned no rows".to_string());
+                bail!(
+                    "Could not read the columns of Power BI dataset {name} ({id}). Reading a \
+                     semantic model's shape needs DAX over its metadata, and none of \
+                     INFO.VIEW.COLUMNS, INFO.COLUMNS or COLUMNSTATISTICS answered. Last error: \
+                     {detail}"
+                )
+            }
+        };
+
+        // Find each alias by name, never by position.
+        //
+        // This layer returns a DAX result's columns in alphabetical order rather than the
+        // order the query asked for: `SELECTCOLUMNS(… "name" … "kind" … "hidden" …)` comes
+        // back as `["[hidden]", "[kind]", "[name]"]`. Reading row[0] as the name therefore
+        // reads the hidden flag, which is how the original code would have produced
+        // nothing even if its metadata function had worked.
+        let index_of = |alias: &str| {
+            table
+                .columns
+                .iter()
+                .position(|column| column.trim_matches(['[', ']']).eq_ignore_ascii_case(alias))
+        };
+        let (name_at, kind_at, hidden_at) =
+            (index_of("name"), index_of("kind"), index_of("hidden"));
+        let name_at = name_at.ok_or_else(|| {
+            anyhow!(
+                "The metadata query for dataset {name} ({id}) returned no column named `name`; \
+                 got {:?}",
+                table.columns
+            )
+        })?;
+
         Ok(Dataset {
             id: id.to_string(),
-            name: id.to_string(),
+            name,
             schema: None,
             columns: table
                 .rows
                 .iter()
                 .filter_map(|row| {
-                    let name = row.first()?.as_str()?.to_string();
-                    let kind = row
-                        .get(1)
+                    // Hidden columns are the model's own bookkeeping — a real model here
+                    // carried `RowNumber-2662979B-…`, which is noise to an agent choosing
+                    // something to group by.
+                    if hidden_at
+                        .and_then(|at| row.get(at))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    {
+                        return None;
+                    }
+                    let name = row.get(name_at)?.as_str()?.to_string();
+                    let kind = kind_at
+                        .and_then(|at| row.get(at))
                         .and_then(Value::as_str)
                         .unwrap_or("string")
                         .to_lowercase();
+                    // Friendly names from INFO.VIEW.COLUMNS ("Integer", "Text", "Date")
+                    // and numeric codes from INFO.COLUMNS both land here, so both
+                    // vocabularies are matched.
+                    let numeric = ["int", "double", "decimal", "currency", "number"]
+                        .iter()
+                        .any(|needle| kind.contains(needle));
+                    let temporal = ["date", "time"].iter().any(|needle| kind.contains(needle));
                     Some(Column {
-                        groupable: !kind.contains("double") && !kind.contains("decimal"),
-                        kind: if kind.contains("int")
-                            || kind.contains("double")
-                            || kind.contains("decimal")
-                        {
+                        groupable: !numeric,
+                        kind: if numeric {
                             "number".into()
-                        } else if kind.contains("date") {
+                        } else if temporal {
                             "time".into()
                         } else {
                             "string".into()
@@ -353,14 +564,37 @@ impl BiBackend for PowerBi {
     async fn export_image(&self, dashboard_id: &str) -> Result<(Vec<u8>, String)> {
         // Export is asynchronous: this starts it and reports what to poll, rather
         // than blocking a tool call for a minute or pretending it finished.
-        let started = self
+        let started = match self
             .http
             .post_json(
                 &self.scope(&format!("reports/{dashboard_id}/ExportTo")),
                 &self.headers(),
                 json!({ "format": "PNG" }),
             )
-            .await?;
+            .await
+        {
+            Ok(started) => started,
+            Err(error) => {
+                // Measured on a real tenant: `403 InvalidRequest — Export report to image
+                // is disabled on tenant level`. Nothing about the request is wrong, and no
+                // retry or permission grant on this account will change it, so passing the
+                // raw status through invites an agent to keep trying. Name the cause.
+                let text = format!("{error:#}");
+                if text.contains("disabled on tenant") {
+                    bail!(
+                        "Power BI export is switched off for this tenant, so no image can be \
+                         produced through the API. This is an administrator setting — \
+                         \"Export reports as image files\" in the Power BI admin portal — not a \
+                         permission on this account, and not something a retry will change. \
+                         Use bi_dashboard_url and capture the window instead."
+                    )
+                }
+                return Err(error).context(
+                    "Power BI refused to start an export. Export requires the report to be in a \
+                     workspace on a Premium or Fabric capacity.",
+                );
+            }
+        };
         Err(anyhow!(
             "Power BI renders exports asynchronously. Export {} was accepted; poll \
              reports/{dashboard_id}/exports/{} until its status is Succeeded, then fetch /file. \
@@ -401,7 +635,50 @@ impl BiBackend for PowerBi {
             .collect::<Vec<_>>()
             .join(" and ");
         Ok(if expression.is_empty() {
-            format!("https://app.powerbi.com/reportEmbed?reportId={dashboard_id}")
+            // Which artefact this id names decides the URL, and getting it wrong produces
+            // a link that loads nothing: `reportEmbed?reportId=` with a *dashboard* id is
+            // a valid-looking URL for a report that does not exist.
+            //
+            // The list endpoint is asked rather than the item endpoint, because Power BI
+            // gives `webUrl` two different meanings under the same name. Measured:
+            //
+            //   GET /dashboards        → webUrl = https://app.powerbi.com/groups/me/dashboards/{id}
+            //   GET /dashboards/{id}   → webUrl = https://app.powerbi.com/dashboardEmbed?dashboardId={id}&config=…
+            //
+            // The first is the page a person opens; the second is for hosting inside
+            // another application and shows chrome-less content. This tool exists to hand
+            // a person a link, so the list's answer is the right one.
+            //
+            // A filtered link is always the report form, because Power BI's URL filter
+            // syntax applies to reports; a dashboard's tiles cannot be filtered this way.
+            let from_list = |collection: Value, id: &str| -> Option<String> {
+                collection
+                    .get("value")?
+                    .as_array()?
+                    .iter()
+                    .find(|item| item.get("id").and_then(Value::as_str) == Some(id))?
+                    .get("webUrl")?
+                    .as_str()
+                    .map(str::to_string)
+            };
+            let dashboards = self
+                .http
+                .get_json(&self.scope("dashboards"), &self.headers())
+                .await
+                .ok()
+                .and_then(|body| from_list(body, dashboard_id));
+            match dashboards {
+                Some(url) => url,
+                None => self
+                    .http
+                    .get_json(&self.scope("reports"), &self.headers())
+                    .await
+                    .ok()
+                    .and_then(|body| from_list(body, dashboard_id))
+                    .unwrap_or_else(|| {
+                        format!("https://app.powerbi.com/reportEmbed?reportId={dashboard_id}")
+                    }),
+            }
         } else {
             format!(
                 "https://app.powerbi.com/reportEmbed?reportId={dashboard_id}&$filter={}",

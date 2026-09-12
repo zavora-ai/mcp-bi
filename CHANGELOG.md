@@ -1,5 +1,61 @@
 # Changelog
 
+## [0.4.0] - 2026-09-13
+
+### Changed — Power BI is verified against a live tenant
+The first commercial adapter proven rather than reviewed, and it needed five corrections.
+Every one looked reasonable against the documentation.
+
+**Both artefacts are listed.** The adapter returned only reports, on the reasoning that
+"reports are what people mean by a dashboard". Against a real tenant that hid the thing
+its owner called their dashboard: the report's pages were named "Page 1" to "Page 5",
+while the dashboard beside it held 14 tiles named "No. of Houses with Water",
+"Satisfied with Water Services", "Responses". `bi_get_dashboard` now returns tiles or
+pages depending on which artefact the id names.
+
+**`INFO.COLUMNS()` does not work.** It answers HTTP 400 with "Failed to execute the DAX
+query." and error code 3239575574. `INFO.VIEW.COLUMNS()` works, and also reports
+`IsHidden` — a real model carried 9 hidden columns out of 28, including two RowNumber
+internals and a hidden date table, none of which an agent should be offered as something
+to group by.
+
+**A dataset described itself as a GUID.** `name` was filled with the id, so
+`bi_list_datasets` said "Water Survey" and `bi_describe_dataset` said
+"a bare GUID" for the same model.
+
+**DAX result columns were read by position.** They arrive as a JSON object, and with
+serde_json's default map they came back alphabetically: a query asking for name, kind and
+hidden returned `["[hidden]", "[kind]", "[name]"]`. Reading row[0] as the name read a
+boolean. Fixed at both ends — aliases are now looked up by name, and the `preserve_order`
+feature keeps the query's order for anyone reading `table.columns`.
+
+**`webUrl` means two different things.** `GET /dashboards` reports a page;
+`GET /dashboards/{id}` reports a chrome-less embed surface, under the same field name.
+`bi_dashboard_url` now returns something a person can open.
+
+Also: a failure to read a model's shape used to be swallowed into an empty column list,
+which reads as "this model has no columns" and is what hid the broken metadata query. It
+now says what it tried and what happened. And a tenant-level export block —
+`403 "Export report to image is disabled on tenant level"` — is explained as an
+administrator setting with an alternative, rather than passed through as a raw status that
+invites a retry.
+
+### Added — `scripts/verify-powerbi.py` and `scripts/powerbi-token.py`
+32 checks against a live tenant over real MCP stdio. The token helper signs in by device
+code against a Microsoft first-party public client already pre-authorised for the Power BI
+API, so verifying needs nothing registered in a tenant and grants nothing the user cannot
+already do.
+
+The script asserts refusals as well as successes. Power BI's REST API exposes no endpoint
+returning the data behind a tile or a page, so `bi_chart_data`, `bi_insights`,
+`bi_drill_down` and `bi_render_chart` must decline; a backend that improvised numbers
+there would be worse than one that declines. `bi_query` with DAX is the route that works.
+
+### Changed
+`serde_json` now uses `preserve_order`, so a JSON object's keys keep their original order
+throughout. All tests pass with it, and it removes a class of bug where reading a result
+positionally works for one query and silently reads the wrong field in another.
+
 ## [0.3.0] - 2026-09-13
 
 ### Added — Metabase renews its own session

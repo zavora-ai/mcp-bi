@@ -1,6 +1,6 @@
 [package]
 name = "mcp-bi"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["James Karanja <james.karanja@zavora.ai>"]
 description = "Business Intelligence MCP Server — read, drill into and render the saved dashboards an organisation already has. Apache Superset is the primary open-source backend, with Metabase alongside it and Power BI, Tableau, Looker, Qlik Sense and Amazon QuickSight as optional backends behind one interface. Returns the numbers behind a visual, computes the statistics worth citing, and draws charts server-side with charts-rs"
@@ -16,7 +16,7 @@ rust-version = "1.94.1"
 adk-mcp-sdk = "0.1"
 rmcp = { version = "3.1.2", features = ["server", "transport-io", "macros"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
